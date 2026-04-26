@@ -42,10 +42,10 @@ function parseArgs(argv) {
 
 function helpText() {
   return `
-kalina - LM Studio CLI agent (OpenAI-compatible API)
+osiris - LM Studio CLI agent (OpenAI-compatible API)
 
 Usage:
-  kalina [--stream] [--history FILE] [--base-url URL] [--model NAME]
+  osiris [--stream] [--history FILE] [--base-url URL] [--model NAME]
          [--system PROMPT] [--temperature N] [--max-tokens N]
          [--timeout SECONDS] [--once "message"]
 

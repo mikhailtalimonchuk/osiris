@@ -1,19 +1,19 @@
 {
-  "name": "kalina",
+  "name": "osiris",
   "version": "0.1.0",
   "description": "Simple CLI agent that connects to LM Studio (OpenAI-compatible API).",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/T-nix/kalina.git"
+    "url": "git+https://github.com/T-nix/osiris.git"
   },
   "bugs": {
-    "url": "https://github.com/T-nix/kalina/issues"
+    "url": "https://github.com/T-nix/osiris/issues"
   },
-  "homepage": "https://github.com/T-nix/kalina#readme",
+  "homepage": "https://github.com/T-nix/osiris#readme",
   "type": "module",
   "bin": {
-    "kalina": "bin/kalina.js"
+    "osiris": "bin/osiris.js"
   },
   "engines": {
     "node": ">=18"
