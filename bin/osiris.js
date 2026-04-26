@@ -1,241 +1,243 @@
 #!/usr/bin/env node
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import readline from "node:readline";
+import { logger }                                    from "../modules/logger.js";
+import { loadConfig }                                from "../modules/config.js";
+import { parseArgs, helpText }                       from "../modules/args.js";
+import { chatOnce, fetchFirstModel, fetchAllModels, fetchAvailableModels, unloadModel, loadModel, getApiRoot } from "../modules/chat.js";
+import { loadHistory, saveHistory }                  from "../modules/history.js";
+import { select }                                    from "../modules/selector.js";
+import { createAsk }                                 from "../modules/input.js";
 
-const DEFAULT_BASE_URL = process.env.LMSTUDIO_BASE_URL ?? "http://localhost:1234/v1";
-const DEFAULT_MODEL = process.env.LMSTUDIO_MODEL ?? "local-model";
+const COMMANDS = ["/exit", "/reset", "/history", "/save", "/status", "/models"];
 
-function parseArgs(argv) {
-  const args = {
-    baseUrl: DEFAULT_BASE_URL,
-    model: DEFAULT_MODEL,
-    system: "You are a helpful CLI assistant.",
-    temperature: 0.2,
-    maxTokens: null,
-    stream: false,
-    timeoutMs: 120_000,
-    history: null,
-    once: null
-  };
+const CONFIG_MAP = [
+  ["baseUrl",     "baseUrl",     v => v],
+  ["model",       "model",       v => v],
+  ["system",      "system",      v => v],
+  ["temperature", "temperature", v => Number(v)],
+  ["maxTokens",   "maxTokens",   v => Number(v)],
+  ["stream",      "stream",      v => Boolean(v)],
+  ["timeout",     "timeoutMs",   v => Math.floor(Number(v) * 1000)],
+  ["history",     "history",     v => v],
+  ["template",    "template",    v => v],
+];
 
-  const it = argv[Symbol.iterator]();
-  for (let cur = it.next(); !cur.done; cur = it.next()) {
-    const a = cur.value;
-    if (a === "--help" || a === "-h") return { ...args, help: true };
-    if (a === "--stream") args.stream = true;
-    else if (a === "--base-url") args.baseUrl = it.next().value;
-    else if (a === "--model") args.model = it.next().value;
-    else if (a === "--system") args.system = it.next().value;
-    else if (a === "--temperature") args.temperature = Number(it.next().value);
-    else if (a === "--max-tokens") args.maxTokens = Number(it.next().value);
-    else if (a === "--timeout") args.timeoutMs = Math.floor(Number(it.next().value) * 1000);
-    else if (a === "--history") args.history = it.next().value;
-    else if (a === "--once") args.once = it.next().value;
-    else {
-      // Unknown arg: ignore for now (keeps it simple)
-    }
+function startSpinner(label) {
+  const frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+  const DIM = "\x1b[2m", R = "\x1b[0m";
+  let i = 0;
+  const t0 = Date.now();
+  const iv = setInterval(() => {
+    const s = ((Date.now() - t0) / 1000).toFixed(1);
+    process.stdout.write(`\r${DIM}  ${frames[i++ % frames.length]} ${label}  ${s}s${R}`);
+  }, 80);
+  return () => { clearInterval(iv); process.stdout.write("\r\x1b[2K"); };
+}
+
+async function loadTemplate(name) {
+  if (!/^[a-z0-9_-]+$/.test(name)) throw new Error(`Invalid template name: "${name}"`);
+  try {
+    const { default: tpl } = await import(new URL(`../templates/${name}.js`, import.meta.url));
+    return tpl;
+  } catch {
+    throw new Error(`Template "${name}" not found. Available: default, fancy, minimal`);
   }
-  return args;
-}
-
-function helpText() {
-  return `
-osiris - LM Studio CLI agent (OpenAI-compatible API)
-
-Usage:
-  osiris [--stream] [--history FILE] [--base-url URL] [--model NAME]
-         [--system PROMPT] [--temperature N] [--max-tokens N]
-         [--timeout SECONDS] [--once "message"]
-
-Defaults:
-  --base-url  ${DEFAULT_BASE_URL}
-  --model     ${DEFAULT_MODEL}
-
-Commands (interactive):
-  /exit, /quit   Quit
-  /reset         Clear conversation (keeps system prompt)
-  /save          Save history (requires --history)
-  /history       Print message list
-`.trim();
-}
-
-function urlJoin(baseUrl, p) {
-  return baseUrl.replace(/\/+$/, "") + "/" + p.replace(/^\/+/, "");
-}
-
-function loadHistory(filePath) {
-  if (!filePath) return null;
-  if (!fs.existsSync(filePath)) return [];
-  const raw = fs.readFileSync(filePath, "utf8");
-  const data = JSON.parse(raw);
-  if (!Array.isArray(data)) throw new Error("History file must be a JSON array.");
-  return data;
-}
-
-function saveHistory(filePath, messages) {
-  if (!filePath) return;
-  const abs = path.resolve(filePath);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, JSON.stringify(messages, null, 2), "utf8");
-}
-
-async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs }) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
-  const body = {
-    model,
-    messages,
-    temperature,
-    stream
-  };
-  if (Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
-
-  const res = await fetch(urlJoin(baseUrl, "/chat/completions"), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal: controller.signal
-  }).finally(() => clearTimeout(t));
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
-  }
-
-  if (!stream) {
-    const data = await res.json();
-    return data?.choices?.[0]?.message?.content ?? "";
-  }
-
-  // SSE streaming: data: {...}\n\n ... data: [DONE]
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  let full = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const parts = buf.split("\n");
-    buf = parts.pop() ?? "";
-
-    for (const line of parts) {
-      const s = line.trim();
-      if (!s.startsWith("data:")) continue;
-      const payload = s.slice(5).trim();
-      if (payload === "[DONE]") {
-        process.stdout.write(os.EOL);
-        return full;
-      }
-      let obj;
-      try {
-        obj = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      const delta = obj?.choices?.[0]?.delta?.content;
-      if (delta) {
-        process.stdout.write(delta);
-        full += delta;
-      }
-    }
-  }
-
-  process.stdout.write(os.EOL);
-  return full;
 }
 
 async function run() {
-  const args = parseArgs(process.argv.slice(2));
+  const { args, explicit } = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log(helpText());
+    process.stdout.write(helpText() + "\n");
     process.exit(0);
   }
 
-  let messages = [{ role: "system", content: args.system }];
-  if (args.history) {
-    const hist = loadHistory(args.history);
-    if (hist?.length && hist[0]?.role === "system") messages = hist;
-    else if (hist) messages = messages.concat(hist);
+  // Enable debug logger as early as possible so every subsequent step is visible
+  if (args.debug) {
+    logger.enable();
+    logger.step("debug", "debug mode enabled");
+    logger.json("args:cli", { ...args, debug: true });
+    logger.json("args:explicit", [...explicit]);
   }
 
+  // Config files fill in any arg the user did not set explicitly on the CLI
+  logger.step("config", "loading config files…");
+  const config = loadConfig();
+  for (const [cfgKey, argKey, transform] of CONFIG_MAP) {
+    if (!explicit.has(argKey) && config[cfgKey] !== undefined) {
+      args[argKey] = transform(config[cfgKey]);
+    }
+  }
+  logger.json("args:final", args);
+
+  // Load the display template before doing any I/O
+  logger.step("template", `loading template: "${args.template}"`);
+  let tpl;
+  try {
+    tpl = await loadTemplate(args.template);
+    logger.ok("template", `loaded: "${args.template}"`);
+  } catch (e) {
+    process.stderr.write(e.message + "\n");
+    process.exit(1);
+  }
+
+  // Auto-detect model if not provided
+  if (!args.model) {
+    logger.step("models", `no model set — querying ${args.baseUrl}`);
+    args.model = await fetchFirstModel(args.baseUrl, args.timeoutMs);
+    if (!args.model) {
+      tpl.error("Cannot load model in LM Studio. Load a model or pass --model.");
+      process.exit(1);
+    }
+    tpl.info(`Auto-selected model: ${args.model}`);
+  } else {
+    logger.ok("models", `model set explicitly: ${args.model}`);
+  }
+
+  // Build the initial message list (load history if requested)
+  let messages = [{ role: "system", content: args.system }];
+  if (args.history) {
+    logger.step("history", `loading history from: ${args.history}`);
+    try {
+      const hist = loadHistory(args.history);
+      if (hist?.length && hist[0]?.role === "system") {
+        messages = hist;
+        logger.ok("history", `resumed session — ${hist.length} message(s)`);
+      } else if (hist) {
+        messages = messages.concat(hist);
+        logger.ok("history", `appended ${hist.length} message(s) to new session`);
+      } else {
+        logger.step("history", "history file not found — starting fresh");
+      }
+    } catch (e) {
+      tpl.error(`Failed to load history: ${e?.message ?? String(e)}`);
+      process.exit(2);
+    }
+  }
+
+  // Non-interactive single-shot mode
   if (args.once) {
+    logger.step("run", `--once mode: "${args.once}"`);
     messages.push({ role: "user", content: args.once });
-    const assistant = await chatOnce({ ...args, messages });
-    if (!args.stream) console.log(assistant);
-    messages.push({ role: "assistant", content: assistant });
-    if (args.history) saveHistory(args.history, messages);
+    try {
+      if (args.stream) tpl.streamStart?.();
+      const { text: assistant, stats } = await chatOnce({ ...args, messages });
+      if (args.stream) tpl.streamEnd?.(stats);
+      else tpl.response(assistant, stats);
+      messages.push({ role: "assistant", content: assistant });
+      if (args.history) { try { saveHistory(args.history, messages); } catch {} }
+    } catch (e) {
+      tpl.error(`Request failed: ${e?.message ?? String(e)}`);
+      process.exit(1);
+    }
     return;
   }
 
-  console.log(`Connected target: ${args.baseUrl}  |  model: ${args.model}`);
-  console.log("Type your message. Commands: /exit, /reset, /save, /history\n");
+  // Interactive loop
+  logger.step("run", "entering interactive loop");
+  tpl.welcome({ baseUrl: args.baseUrl, model: args.model });
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = () => new Promise((resolve) => rl.question("> ", resolve));
+  const ask = createAsk(COMMANDS);
+
+  const sessionStart = Date.now();
+  const sessionStats = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
 
   while (true) {
     let user;
     try {
-      user = String(await ask()).trim();
+      user = String(await ask(tpl.prompt)).trim();
     } catch {
       break;
     }
+
     if (!user) continue;
+
     if (user === "/exit" || user === "/quit") break;
+
     if (user === "/reset") {
       messages = [{ role: "system", content: args.system }];
-      console.log("(history reset)");
+      tpl.info("history reset");
       continue;
     }
+
     if (user === "/history") {
-      console.log(JSON.stringify(messages, null, 2));
+      process.stdout.write(JSON.stringify(messages, null, 2) + "\n");
       continue;
     }
+
     if (user === "/save") {
-      if (!args.history) {
-        console.log("No --history path provided.");
-        continue;
+      if (!args.history) { tpl.info("no --history path provided"); continue; }
+      try {
+        saveHistory(args.history, messages);
+        tpl.info(`saved to ${args.history}`);
+      } catch (e) {
+        tpl.error(`failed to save: ${e?.message ?? String(e)}`);
       }
-      saveHistory(args.history, messages);
-      console.log(`(saved to ${args.history})`);
+      continue;
+    }
+
+    if (user === "/status") {
+      tpl.status?.({ sessionStart, sessionStats, model: args.model, baseUrl: args.baseUrl });
+      continue;
+    }
+
+    if (user === "/models") {
+      tpl.info(`API root: ${getApiRoot(args.baseUrl)}`);
+
+      let stopSpinner = startSpinner("fetching available models");
+      const models = await fetchAvailableModels(args.baseUrl, args.timeoutMs);
+      stopSpinner();
+
+      if (!models.length) { tpl.error("No models returned — check LM Studio version supports /api/v0/models"); continue; }
+      tpl.info(`${models.length} model(s) found`);
+
+      const picked = await select(models, { label: `select a model  (loaded: ${args.model}):` });
+      if (!picked || picked === args.model) continue;
+
+      stopSpinner = startSpinner(`unloading  ${args.model}`);
+      try {
+        await unloadModel(args.baseUrl, args.model, args.timeoutMs);
+        stopSpinner();
+        tpl.info("unloaded");
+      } catch (e) {
+        stopSpinner();
+        tpl.error(`Unload failed: ${e?.message ?? String(e)}`);
+      }
+
+      stopSpinner = startSpinner(`loading  ${picked}`);
+      try {
+        await loadModel(args.baseUrl, picked);
+        stopSpinner();
+        args.model = picked;
+        tpl.info(`Model → ${picked}`);
+      } catch (e) {
+        stopSpinner();
+        tpl.error(`Load failed: ${e?.message ?? String(e)}`);
+      }
       continue;
     }
 
     messages.push({ role: "user", content: user });
     try {
-      const assistant = await chatOnce({ ...args, messages });
-      if (!args.stream) console.log(assistant);
+      if (args.stream) tpl.streamStart?.();
+      const { text: assistant, stats } = await chatOnce({ ...args, messages });
+      if (args.stream) tpl.streamEnd?.(stats);
+      else tpl.response(assistant, stats);
       messages.push({ role: "assistant", content: assistant });
-      if (args.history) {
-        try {
-          saveHistory(args.history, messages);
-        } catch {
-          // best-effort
-        }
-      }
+      sessionStats.requests      += 1;
+      sessionStats.promptTokens     += stats.promptTokens;
+      sessionStats.completionTokens += stats.completionTokens;
+      sessionStats.totalTokens      += stats.totalTokens;
+      if (args.history) { try { saveHistory(args.history, messages); } catch {} }
     } catch (e) {
-      messages.pop(); // remove last user message for clean retry
-      console.error(`Request failed: ${e?.message ?? String(e)}`);
+      messages.pop(); // remove last user message so the turn can be retried cleanly
+      tpl.error(`Request failed: ${e?.message ?? String(e)}`);
     }
   }
 
-  rl.close();
-  if (args.history) {
-    try {
-      saveHistory(args.history, messages);
-    } catch {
-      // best-effort
-    }
-  }
+  process.stdin.pause();
+  if (args.history) { try { saveHistory(args.history, messages); } catch {} }
 }
 
 run().catch((e) => {
-  console.error(e?.stack ?? String(e));
+  process.stderr.write((e?.stack ?? String(e)) + "\n");
   process.exit(1);
 });
-

@@ -12,11 +12,17 @@
   },
   "homepage": "https://github.com/T-nix/osiris#readme",
   "type": "module",
+  "scripts": {
+    "start": "node bin/osiris.js --debug"
+  },
   "bin": {
-    "osiris": "bin/osiris.js"
+    "osiris": "bin/osiris.js --debug"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.7.0"
   }
 }
 

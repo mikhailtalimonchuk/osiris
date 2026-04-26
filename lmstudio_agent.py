@@ -1,18 +1,132 @@
 import argparse
 import json
 import os
+import pathlib
 import sys
 from typing import Any, Dict, List, Optional
 
 import requests
 
+# ---------------------------------------------------------------------------
+# Debug logger — writes to stderr, activated via --debug
+# ---------------------------------------------------------------------------
+_debug_on = False
+
+def _dbg(tag: str, msg: str, data: object = None) -> None:
+    if not _debug_on:
+        return
+    sys.stderr.write(f"\x1b[2m[\x1b[0m\x1b[36m{tag}\x1b[0m\x1b[2m]\x1b[0m {msg}\n")
+    if data is not None:
+        sys.stderr.write(json.dumps(data, indent=2, ensure_ascii=False)
+                         .replace("\n", "\n  ") + "\n")
+
 
 DEFAULT_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
-DEFAULT_MODEL = os.environ.get("LMSTUDIO_MODEL", "local-model")
+DEFAULT_MODEL = os.environ.get("LMSTUDIO_MODEL")  # None → auto-detect from /v1/models
+
+HOME = pathlib.Path.home()
+ROOT_CONFIG_FILE = HOME / ".osiris" / "config.json"
+PROJECT_CONFIG_NAME = ".osiris.json"
+
+# Maps JSON config keys (camelCase) to argparse dest names (snake_case).
+_CONFIG_TO_ARGPARSE: Dict[str, str] = {
+    "baseUrl":     "base_url",
+    "model":       "model",
+    "system":      "system",
+    "temperature": "temperature",
+    "maxTokens":   "max_tokens",
+    "stream":      "stream",
+    "timeout":     "timeout",
+    "history":     "history",
+}
+
+
+def _read_json_file(p: pathlib.Path) -> Optional[dict]:
+    try:
+        if not p.exists():
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def load_config() -> dict:
+    _dbg("config", f"checking root config: {ROOT_CONFIG_FILE}")
+    root_cfg: dict = _read_json_file(ROOT_CONFIG_FILE) or {}
+    if root_cfg:
+        _dbg("config", "root config loaded", root_cfg)
+    else:
+        _dbg("config", "root config not found or empty — using defaults")
+
+    search_depth = int(root_cfg.get("searchDepth", 3))
+    _dbg("config", f"searchDepth = {search_depth}")
+
+    cwd = pathlib.Path.cwd()
+    ancestor_cfgs: list = []
+
+    if cwd.is_relative_to(HOME):
+        _dbg("config", f"cwd is within ~ — searching {search_depth} level(s) up")
+        d = cwd
+        for _ in range(search_depth):
+            parent = d.parent
+            if parent == d:  # filesystem root
+                break
+            d = parent
+            if not d.is_relative_to(HOME):
+                _dbg("config", f"stopped at {d} — outside ~")
+                break
+            cfg_path = d / PROJECT_CONFIG_NAME
+            cfg = _read_json_file(cfg_path)
+            if cfg:
+                _dbg("config", f"ancestor config found: {cfg_path}", cfg)
+                ancestor_cfgs.insert(0, cfg)
+            else:
+                _dbg("config", f"no config at: {cfg_path}")
+    else:
+        _dbg("config", f"cwd {cwd} is outside ~ — skipping ancestor search")
+
+    cwd_cfg_path = cwd / PROJECT_CONFIG_NAME
+    _dbg("config", f"checking cwd config: {cwd_cfg_path}")
+    cwd_cfg: dict = _read_json_file(cwd_cfg_path) or {}
+    if cwd_cfg:
+        _dbg("config", "cwd config loaded", cwd_cfg)
+    else:
+        _dbg("config", "no cwd config found")
+
+    merged = {k: v for k, v in root_cfg.items() if k != "searchDepth"}
+    for cfg in ancestor_cfgs:
+        merged.update(cfg)
+    merged.update(cwd_cfg)
+
+    if _debug_on:
+        _dbg("config:merged", "final merged config", merged)
+
+    return merged
 
 
 def _url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + "/" + path.lstrip("/")
+
+
+def fetch_first_model(base_url: str, timeout_s: float) -> Optional[str]:
+    url = _url(base_url, "/models")
+    _dbg("models", f"GET {url} (timeout: {timeout_s}s)")
+    try:
+        r = requests.get(url, timeout=timeout_s)
+        r.raise_for_status()
+        models = r.json().get("data", [])
+        _dbg("models", f"HTTP {r.status_code} — {len(models)} model(s) returned")
+        if not models:
+            _dbg("models", "list is empty — no model loaded in LM Studio")
+            return None
+        _dbg("models:list", "available models", [m.get("id") for m in models])
+        selected = models[0]["id"]
+        _dbg("models", f"auto-selected: {selected}")
+        return selected
+    except Exception as e:
+        _dbg("models", f"request error: {e}")
+        return None
 
 
 def _print_streaming_delta(resp: requests.Response) -> str:
@@ -86,6 +200,9 @@ def load_history(path: str) -> List[Dict[str, str]]:
         data = json.load(f)
     if not isinstance(data, list):
         raise ValueError("History file must be a JSON list of messages.")
+    for i, msg in enumerate(data):
+        if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+            raise ValueError(f"Message at index {i} is missing 'role' or 'content'.")
     return data  # type: ignore[return-value]
 
 
@@ -96,6 +213,15 @@ def save_history(path: str, messages: List[Dict[str, str]]) -> None:
 
 
 def main() -> int:
+    config = load_config()
+    # Translate config keys to argparse dest names so set_defaults() can override them.
+    # CLI args always beat set_defaults(), which in turn beats add_argument(default=...).
+    argparse_defaults = {
+        dest: config[cfg_key]
+        for cfg_key, dest in _CONFIG_TO_ARGPARSE.items()
+        if cfg_key in config
+    }
+
     p = argparse.ArgumentParser(description="Simple CLI agent for LM Studio (OpenAI-compatible API).")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL, help="LM Studio base URL (default: %(default)s)")
     p.add_argument("--model", default=DEFAULT_MODEL, help="Model name to send (default: %(default)s)")
@@ -105,7 +231,27 @@ def main() -> int:
     p.add_argument("--stream", action="store_true", help="Stream tokens")
     p.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds")
     p.add_argument("--history", default=None, help="Path to JSON history file (optional)")
+    p.add_argument("--once", default=None, metavar="MESSAGE", help="Send a single message and exit (non-interactive)")
+    p.add_argument("--debug", action="store_true", help="Print debug info for each step to stderr")
+    p.set_defaults(**argparse_defaults)
     args = p.parse_args()
+
+    global _debug_on
+    if args.debug:
+        _debug_on = True
+        _dbg("debug", "debug mode enabled")
+        _dbg("args", "parsed arguments", {k: v for k, v in vars(args).items() if k != "debug"})
+
+    model = args.model
+    if not model:
+        _dbg("models", f"no model set — querying {args.base_url}")
+        model = fetch_first_model(args.base_url, args.timeout)
+        if not model:
+            print("No model loaded in LM Studio. Load a model or pass --model.", file=sys.stderr)
+            return 1
+        print(f"Auto-selected model: {model}")
+    else:
+        _dbg("models", f"model set explicitly: {model}")
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": args.system}]
     if args.history:
@@ -120,7 +266,32 @@ def main() -> int:
             print(f"Failed to load history: {e}", file=sys.stderr)
             return 2
 
-    print(f"Connected target: {args.base_url}  |  model: {args.model}")
+    if args.once:
+        messages.append({"role": "user", "content": args.once})
+        try:
+            assistant = chat(
+                base_url=args.base_url,
+                model=model,
+                messages=messages,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                stream=args.stream,
+                timeout_s=args.timeout,
+            )
+        except Exception as e:
+            print(f"Request failed: {e}", file=sys.stderr)
+            return 1
+        if not args.stream:
+            print(assistant)
+        messages.append({"role": "assistant", "content": assistant})
+        if args.history:
+            try:
+                save_history(args.history, messages)
+            except Exception:
+                pass
+        return 0
+
+    print(f"Connected to: {args.base_url}  |  model: {model}")
     print("Type your message. Commands: /exit, /reset, /save, /history\n")
 
     while True:
@@ -156,7 +327,7 @@ def main() -> int:
         try:
             assistant = chat(
                 base_url=args.base_url,
-                model=args.model,
+                model=model,
                 messages=messages,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
