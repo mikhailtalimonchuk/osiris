@@ -18,7 +18,7 @@ npm i -g kalina
 Directly from **GitHub** (no publish needed):
 
 ```bash
-npm i -g github:<your-user>/<your-repo>
+npm i -g npm i -g github:T-nix/kalina
 ```
 
 Dev install from a local clone:
