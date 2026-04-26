@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kalina"
+name = "osiris"
 version = "0.1.0"
 description = "Simple CLI agent that connects to LM Studio (OpenAI-compatible API)."
 readme = "README.md"
@@ -13,5 +13,5 @@ dependencies = [
 ]
 
 [project.scripts]
-kalina = "lmstudio_agent:main"
+osiris = "lmstudio_agent:main"
 
