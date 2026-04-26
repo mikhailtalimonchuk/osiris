@@ -7,6 +7,7 @@ import { TOOLS, executeTool } from "../modules/tools.js";
 import { loadHistory, saveHistory }                  from "../modules/history.js";
 import { select }                                    from "../modules/selector.js";
 import { createAsk }                                 from "../modules/input.js";
+import { appendStat, getStatusDir }                  from "../modules/stats.js";
 
 const COMMANDS = ["/exit", "/reset", "/history", "/save", "/status", "/models", "/design"];
 
@@ -43,13 +44,21 @@ async function runWithTools({ args, messages, tpl }) {
   let streamOpen = false;
 
   while (true) {
-    if (args.stream && !streamOpen) { tpl.streamStart?.(); streamOpen = true; }
+    tpl.thinking?.();
 
     const { text, stats, toolCalls } = await chatOnce({
       ...args,
       messages: msgs,
       tools: TOOLS,
+      // In stream mode: stop spinner and open box border on first server chunk
+      onFirstChunk: () => {
+        tpl.thinkingStop?.();
+        if (!streamOpen) { tpl.streamStart?.(); streamOpen = true; }
+      },
     });
+
+    // For non-stream mode thinkingStop is not yet called; idempotent for stream
+    tpl.thinkingStop?.();
 
     if (toolCalls?.length) {
       if (streamOpen) { tpl.streamCancel?.(); streamOpen = false; }
@@ -158,6 +167,9 @@ async function run() {
     }
   }
 
+  // Stats directory — one file per day under ~/.osiris/status/
+  const statusDir = getStatusDir(config.statusDir);
+
   // Non-interactive single-shot mode
   if (args.once) {
     logger.step("run", `--once mode: "${args.once}"`);
@@ -167,6 +179,8 @@ async function run() {
       for (const m of toolMsgs) messages.push(m);
       messages.push({ role: "assistant", content: assistant });
       if (args.history) { try { saveHistory(args.history, messages); } catch {} }
+      // Persist stats
+      try { appendStat(statusDir, { model: args.model, ...stats }); } catch {}
     } catch (e) {
       tpl.error(`Request failed: ${e?.message ?? String(e)}`);
       process.exit(1);
@@ -218,7 +232,7 @@ async function run() {
     }
 
     if (user === "/status") {
-      tpl.status?.({ sessionStart, sessionStats, model: args.model, baseUrl: args.baseUrl });
+      await tpl.status?.({ sessionStart, sessionStats, model: args.model, baseUrl: args.baseUrl, statusDir });
       continue;
     }
 
@@ -236,7 +250,7 @@ async function run() {
       const picked = await select(models, { label: `select a model  (loaded: ${args.model}):` });
       if (!picked || picked === args.model) continue;
 
-      stopSpinner = startSpinner(`unloading  ${args.model}`);
+      let stopSpinner = startSpinner(`unloading  ${args.model}`);
       try {
         await unloadModel(args.baseUrl, args.model, args.timeoutMs);
         stopSpinner();
@@ -297,6 +311,8 @@ async function run() {
       sessionStats.completionTokens += stats.completionTokens;
       sessionStats.totalTokens      += stats.totalTokens;
       if (args.history) { try { saveHistory(args.history, messages); } catch {} }
+      // Persist stats
+      try { appendStat(statusDir, { model: args.model, ...stats }); } catch {}
     } catch (e) {
       messages.pop();
       tpl.error(`Request failed: ${e?.message ?? String(e)}`);

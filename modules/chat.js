@@ -116,7 +116,7 @@ export async function loadModel(baseUrl, modelId) {
   }
 }
 
-export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs, tools }) {
+export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs, tools, onFirstChunk }) {
   const url = urlJoin(baseUrl, "/chat/completions");
   const body = {
     model, messages, temperature, stream,
@@ -157,7 +157,7 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
   }
 
   // SSE streaming — accumulate both content and tool_call deltas
-  let buf = "", full = "", usage = null;
+  let buf = "", full = "", usage = null, firstChunkFired = false;
   const tcMap = {}; // index → { id, function: { name, arguments } }
 
   for await (const chunk of res.data) {
@@ -178,6 +178,7 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
       }
       let obj;
       try { obj = JSON.parse(payload); } catch { continue; }
+      if (!firstChunkFired) { firstChunkFired = true; onFirstChunk?.(); }
       if (obj?.usage) usage = obj.usage;
 
       const choice = obj?.choices?.[0];
