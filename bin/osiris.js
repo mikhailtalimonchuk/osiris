@@ -8,7 +8,7 @@ import { loadHistory, saveHistory }                  from "../modules/history.js
 import { select }                                    from "../modules/selector.js";
 import { createAsk }                                 from "../modules/input.js";
 
-const COMMANDS = ["/exit", "/reset", "/history", "/save", "/status", "/models"];
+const COMMANDS = ["/exit", "/reset", "/history", "/save", "/status", "/models", "/design"];
 
 const CONFIG_MAP = [
   ["baseUrl",     "baseUrl",     v => v],
@@ -21,6 +21,8 @@ const CONFIG_MAP = [
   ["history",     "history",     v => v],
   ["template",    "template",    v => v],
 ];
+
+const AVAILABLE_TEMPLATES = ["default", "fancy", "minimal"];
 
 function startSpinner(label) {
   const frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
@@ -82,7 +84,7 @@ async function loadTemplate(name) {
     const { default: tpl } = await import(new URL(`../templates/${name}.js`, import.meta.url));
     return tpl;
   } catch {
-    throw new Error(`Template "${name}" not found. Available: default, fancy, minimal`);
+    throw new Error(`Template "${name}" not found. Available: ${AVAILABLE_TEMPLATES.join(", ")}`);
   }
 }
 
@@ -223,9 +225,10 @@ async function run() {
     if (user === "/models") {
       tpl.info(`API root: ${getApiRoot(args.baseUrl)}`);
 
-      let stopSpinner = startSpinner("fetching available models");
-      const models = await fetchAvailableModels(args.baseUrl, args.timeoutMs);
-      stopSpinner();
+      const stopFetch = startSpinner("fetching available models");
+      let models;
+      try { models = await fetchAvailableModels(args.baseUrl, args.timeoutMs); }
+      finally { stopFetch(); }
 
       if (!models.length) { tpl.error("No models returned — check LM Studio version supports /api/v0/models"); continue; }
       tpl.info(`${models.length} model(s) found`);
@@ -252,6 +255,34 @@ async function run() {
       } catch (e) {
         stopSpinner();
         tpl.error(`Load failed: ${e?.message ?? String(e)}`);
+      }
+      continue;
+    }
+
+    if (user === "/design") {
+      const labels = AVAILABLE_TEMPLATES.map(t =>
+        t === args.template ? `${t} (current)` : t
+      );
+
+      const picked = await select(labels, { label: "select a design:" });
+      if (!picked) continue;
+
+      // Extract template name (strip " (current)" suffix if present)
+      const newTemplate = picked.replace(" (current)", "");
+
+      if (newTemplate === args.template) {
+        tpl.info(`already using "${newTemplate}"`);
+        continue;
+      }
+
+      try {
+        const newTpl = await loadTemplate(newTemplate);
+        tpl = newTpl;
+        args.template = newTemplate;
+        logger.ok("template", `switched to: "${newTemplate}"`);
+        tpl.info(`design → ${newTemplate}`);
+      } catch (e) {
+        tpl.error(`failed to load design: ${e.message}`);
       }
       continue;
     }

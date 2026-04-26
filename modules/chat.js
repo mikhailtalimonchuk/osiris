@@ -1,6 +1,6 @@
 import axios from "axios";
 import os from "node:os";
-import dns from "dns";
+import dns from "dns"; // force IPv4 — LM Studio on localhost doesn't always respond on IPv6
 import http from "http";
 import { logger } from "./logger.js";
 
@@ -13,11 +13,7 @@ export async function fetchFirstModel(baseUrl, timeoutMs) {
   logger.step("models", `GET ${url} (timeout: ${timeoutMs}ms)`);
   try {
     dns.setDefaultResultOrder("ipv4first");
-    const agent = new http.Agent({
-      family: 4,  
-      keepAlive: true,
-      localAddress: "192.168.1.201"
-    });
+    const agent = new http.Agent({ family: 4, keepAlive: true });
     const res = await axios.get(url, { timeout: timeoutMs, httpAgent: agent, proxy: false });
     const models = res.data?.data ?? [];
     logger.ok("models", `HTTP ${res.status} — ${models.length} model(s) returned`);

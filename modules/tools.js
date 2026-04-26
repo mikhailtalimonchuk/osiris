@@ -1,13 +1,31 @@
 import fs from "node:fs";
 import path from "node:path";
 
+const ROOT = process.cwd();
+
+function safePath(p) {
+  const resolved = path.resolve(p);
+  if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep))
+    throw new Error(`Path "${p}" is outside the project root`);
+  return resolved;
+}
+
 // ── implementations ──────────────────────────────────────────────────────────
 
+const patternCache = new Map();
+function compilePattern(pattern) {
+  if (!patternCache.has(pattern)) {
+    patternCache.set(pattern, new RegExp(
+      "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
+      "i"
+    ));
+  }
+  return patternCache.get(pattern);
+}
+
 function findPaths({ pattern = "*", dir = ".", type = "any" }) {
-  const re = new RegExp(
-    "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
-    "i"
-  );
+  const re = compilePattern(pattern);
+  const root = safePath(dir);
   const results = [];
 
   function walk(cur) {
@@ -25,26 +43,26 @@ function findPaths({ pattern = "*", dir = ".", type = "any" }) {
     }
   }
 
-  walk(dir);
+  walk(root);
   return results.length ? results.join("\n") : "No matches found.";
 }
 
 function listDir({ path: p = "." }) {
   try {
-    const entries = fs.readdirSync(p, { withFileTypes: true });
+    const entries = fs.readdirSync(safePath(p), { withFileTypes: true });
     if (!entries.length) return "(empty)";
     return entries.map(e => `${e.isDirectory() ? "d" : "f"}  ${e.name}`).join("\n");
   } catch (e) { return `Error: ${e.message}`; }
 }
 
 function makeDir({ path: p }) {
-  try { fs.mkdirSync(p, { recursive: true }); return `Created: ${p}`; }
+  try { fs.mkdirSync(safePath(p), { recursive: true }); return `Created: ${p}`; }
   catch (e) { return `Error: ${e.message}`; }
 }
 
 function readFile({ path: p, max_lines = 500 }) {
   try {
-    const text = fs.readFileSync(p, "utf8");
+    const text = fs.readFileSync(safePath(p), "utf8");
     const lines = text.split("\n");
     return lines.length > max_lines
       ? lines.slice(0, max_lines).join("\n") + `\n… (${lines.length - max_lines} lines truncated)`
@@ -54,22 +72,24 @@ function readFile({ path: p, max_lines = 500 }) {
 
 function writeFile({ path: p, content }) {
   try {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, content, "utf8");
+    const safe = safePath(p);
+    fs.mkdirSync(path.dirname(safe), { recursive: true });
+    fs.writeFileSync(safe, content, "utf8");
     return `Written: ${p}`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
 function appendFile({ path: p, content }) {
-  try { fs.appendFileSync(p, content, "utf8"); return `Appended to: ${p}`; }
+  try { fs.appendFileSync(safePath(p), content, "utf8"); return `Appended to: ${p}`; }
   catch (e) { return `Error: ${e.message}`; }
 }
 
 function deletePath({ path: p, recursive = false }) {
   try {
-    const stat = fs.statSync(p);
-    if (stat.isDirectory()) fs.rmSync(p, { recursive });
-    else fs.unlinkSync(p);
+    const safe = safePath(p);
+    const stat = fs.statSync(safe);
+    if (stat.isDirectory()) fs.rmSync(safe, { recursive });
+    else fs.unlinkSync(safe);
     return `Deleted: ${p}`;
   } catch (e) { return `Error: ${e.message}`; }
 }

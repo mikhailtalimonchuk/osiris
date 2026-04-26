@@ -14,6 +14,7 @@ __pycache__/
 dist/
 build/
 
+.osiris.json
 .env
 .DS_Store
 Thumbs.db

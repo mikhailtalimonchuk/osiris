@@ -68,5 +68,8 @@ Commands (interactive):
   /reset         Clear conversation (keeps system prompt)
   /save          Save history (requires --history)
   /history       Print message list as JSON
+  /status        Show session stats (tokens, requests, uptime)
+  /models        Browse and switch loaded models
+  /design        Switch display template at runtime
 `.trim();
 }
