@@ -120,16 +120,17 @@ export async function loadModel(baseUrl, modelId) {
   }
 }
 
-export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs }) {
+export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs, tools }) {
   const url = urlJoin(baseUrl, "/chat/completions");
   const body = {
     model, messages, temperature, stream,
     ...(Number.isFinite(maxTokens) ? { max_tokens: maxTokens } : {}),
     ...(stream ? { stream_options: { include_usage: true } } : {}),
+    ...(tools?.length ? { tools, tool_choice: "auto" } : {}),
   };
 
   logger.step("chat", `POST ${url}`);
-  logger.json("chat:request", { model, temperature, stream, maxTokens, messageCount: messages.length });
+  logger.json("chat:request", { model, temperature, stream, maxTokens, tools: tools?.length ?? 0, messageCount: messages.length });
 
   const startTime = Date.now();
   let res;
@@ -151,16 +152,17 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
   logger.ok("chat", `HTTP ${res.status}${stream ? " (streaming)" : ""}`);
 
   if (!stream) {
-    const content = res.data?.choices?.[0]?.message?.content ?? "";
-    const stats = makeStats(res.data?.usage, Date.now() - startTime);
-    logger.step("chat", `response length: ${content.length} chars`);
-    return { text: content, stats };
+    const msg     = res.data?.choices?.[0]?.message ?? {};
+    const content = msg.content ?? "";
+    const toolCalls = msg.tool_calls?.length ? msg.tool_calls : null;
+    const stats   = makeStats(res.data?.usage, Date.now() - startTime);
+    logger.step("chat", `response: ${content.length} chars, tool_calls: ${toolCalls?.length ?? 0}`);
+    return { text: content, stats, toolCalls };
   }
 
-  // SSE streaming — res.data is a Node.js readable stream when responseType:"stream"
-  let buf = "";
-  let full = "";
-  let usage = null;
+  // SSE streaming — accumulate both content and tool_call deltas
+  let buf = "", full = "", usage = null;
+  const tcMap = {}; // index → { id, function: { name, arguments } }
 
   for await (const chunk of res.data) {
     buf += chunk.toString("utf8");
@@ -173,23 +175,35 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
       const payload = s.slice(5).trim();
       if (payload === "[DONE]") {
         process.stdout.write(os.EOL);
+        const toolCalls = Object.keys(tcMap).length ? Object.values(tcMap) : null;
         const stats = makeStats(usage, Date.now() - startTime);
-        logger.step("chat", `stream done — ${full.length} chars total`);
-        return { text: full, stats };
+        logger.step("chat", `stream done — ${full.length} chars, tool_calls: ${toolCalls?.length ?? 0}`);
+        return { text: full, stats, toolCalls };
       }
       let obj;
       try { obj = JSON.parse(payload); } catch { continue; }
       if (obj?.usage) usage = obj.usage;
-      const delta = obj?.choices?.[0]?.delta?.content;
-      if (delta) {
-        process.stdout.write(delta);
-        full += delta;
+
+      const choice = obj?.choices?.[0];
+      if (!choice) continue;
+
+      // Accumulate tool_call deltas
+      for (const tc of choice.delta?.tool_calls ?? []) {
+        const idx = tc.index ?? 0;
+        if (!tcMap[idx]) tcMap[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
+        if (tc.id)                       tcMap[idx].id                       += tc.id;
+        if (tc.function?.name)           tcMap[idx].function.name            += tc.function.name;
+        if (tc.function?.arguments)      tcMap[idx].function.arguments       += tc.function.arguments;
       }
+
+      const delta = choice.delta?.content;
+      if (delta) { process.stdout.write(delta); full += delta; }
     }
   }
 
   process.stdout.write(os.EOL);
+  const toolCalls = Object.keys(tcMap).length ? Object.values(tcMap) : null;
   const stats = makeStats(usage, Date.now() - startTime);
   logger.step("chat", `stream ended without [DONE] — ${full.length} chars total`);
-  return { text: full, stats };
+  return { text: full, stats, toolCalls };
 }

@@ -86,6 +86,22 @@ export default {
     process.stdout.write(`\n${BLUE}╭${"─".repeat(w - 2)}╮${R}\n${BLUE}│${R} `);
   },
 
+  streamCancel() {
+    const w = cols();
+    process.stdout.write(`${BLUE}╰${"─".repeat(w - 2)}╯${R}\n`);
+  },
+
+  toolCall({ name, args, result }) {
+    const w = cols();
+    const argStr = JSON.stringify(args);
+    const preview = result.length > 200 ? result.slice(0, 200) + "…" : result;
+    drawBox([
+      `${YELLOW}⚙${R} ${BOLD}${name}${R}  ${DIM}${argStr}${R}`,
+      `${DIM}${"─".repeat(w - 6)}${R}`,
+      ...preview.split("\n").slice(0, 12).map(l => `${DIM}${l}${R}`),
+    ], YELLOW);
+  },
+
   streamEnd(stats) {
     const w = cols();
     // cursor is already on a new line (chatOnce wrote os.EOL)

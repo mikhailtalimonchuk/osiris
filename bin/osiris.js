@@ -3,6 +3,7 @@ import { logger }                                    from "../modules/logger.js"
 import { loadConfig }                                from "../modules/config.js";
 import { parseArgs, helpText }                       from "../modules/args.js";
 import { chatOnce, fetchFirstModel, fetchAllModels, fetchAvailableModels, unloadModel, loadModel, getApiRoot } from "../modules/chat.js";
+import { TOOLS, executeTool } from "../modules/tools.js";
 import { loadHistory, saveHistory }                  from "../modules/history.js";
 import { select }                                    from "../modules/selector.js";
 import { createAsk }                                 from "../modules/input.js";
@@ -31,6 +32,48 @@ function startSpinner(label) {
     process.stdout.write(`\r${DIM}  ${frames[i++ % frames.length]} ${label}  ${s}s${R}`);
   }, 80);
   return () => { clearInterval(iv); process.stdout.write("\r\x1b[2K"); };
+}
+
+async function runWithTools({ args, messages, tpl }) {
+  const msgs      = [...messages]; // working copy — caller's array is not modified here
+  const toolMsgs  = [];            // intermediate messages to add to history after
+
+  let streamOpen = false;
+
+  while (true) {
+    if (args.stream && !streamOpen) { tpl.streamStart?.(); streamOpen = true; }
+
+    const { text, stats, toolCalls } = await chatOnce({
+      ...args,
+      messages: msgs,
+      tools: TOOLS,
+    });
+
+    if (toolCalls?.length) {
+      if (streamOpen) { tpl.streamCancel?.(); streamOpen = false; }
+
+      const assistantMsg = { role: "assistant", content: text || null, tool_calls: toolCalls };
+      msgs.push(assistantMsg);
+      toolMsgs.push(assistantMsg);
+
+      for (const call of toolCalls) {
+        let callArgs;
+        try { callArgs = JSON.parse(call.function.arguments); } catch { callArgs = {}; }
+        const result = executeTool(call.function.name, callArgs);
+        tpl.toolCall?.({ name: call.function.name, args: callArgs, result });
+        const toolMsg = { role: "tool", tool_call_id: call.id, content: result };
+        msgs.push(toolMsg);
+        toolMsgs.push(toolMsg);
+      }
+      continue;
+    }
+
+    // Final response — display it
+    if (streamOpen) { tpl.streamEnd?.(stats); streamOpen = false; }
+    else tpl.response(text, stats);
+
+    return { text, stats, toolMsgs };
+  }
 }
 
 async function loadTemplate(name) {
@@ -118,10 +161,8 @@ async function run() {
     logger.step("run", `--once mode: "${args.once}"`);
     messages.push({ role: "user", content: args.once });
     try {
-      if (args.stream) tpl.streamStart?.();
-      const { text: assistant, stats } = await chatOnce({ ...args, messages });
-      if (args.stream) tpl.streamEnd?.(stats);
-      else tpl.response(assistant, stats);
+      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl });
+      for (const m of toolMsgs) messages.push(m);
       messages.push({ role: "assistant", content: assistant });
       if (args.history) { try { saveHistory(args.history, messages); } catch {} }
     } catch (e) {
@@ -217,18 +258,16 @@ async function run() {
 
     messages.push({ role: "user", content: user });
     try {
-      if (args.stream) tpl.streamStart?.();
-      const { text: assistant, stats } = await chatOnce({ ...args, messages });
-      if (args.stream) tpl.streamEnd?.(stats);
-      else tpl.response(assistant, stats);
+      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl });
+      for (const m of toolMsgs) messages.push(m);
       messages.push({ role: "assistant", content: assistant });
-      sessionStats.requests      += 1;
+      sessionStats.requests         += 1;
       sessionStats.promptTokens     += stats.promptTokens;
       sessionStats.completionTokens += stats.completionTokens;
       sessionStats.totalTokens      += stats.totalTokens;
       if (args.history) { try { saveHistory(args.history, messages); } catch {} }
     } catch (e) {
-      messages.pop(); // remove last user message so the turn can be retried cleanly
+      messages.pop();
       tpl.error(`Request failed: ${e?.message ?? String(e)}`);
     }
   }
