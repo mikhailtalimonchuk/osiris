@@ -56,6 +56,8 @@ export default {
     process.stdout.write(`  ${DIM}url  ${R}${baseUrl}\n`);
     process.stdout.write(`  ${DIM}mdl  ${R}${model}\n`);
     process.stdout.write(`${sep}\n`);
+    process.stdout.write(`  ${DIM}tip: type ${R}/  ${DIM}+ enter to pick a command  ·  tab to autocomplete${R}\n`);
+    process.stdout.write(`  ${DIM}tip: start a message with ${R}#  ${DIM}to reset context${R}\n`);
   },
 
   thinking() {
@@ -76,6 +78,18 @@ export default {
 
   streamEnd() {
     process.stdout.write(`${R}\n`);
+  },
+
+  /** Display a tool call with clear labels for each section */
+  toolCall({ name, args, result }) {
+    const argStr = JSON.stringify(args);
+    const preview = result.length > 200 ? result.slice(0, 200) + "…" : result;
+    process.stdout.write(`\n${YELLOW}⚙ Tool: ${BOLD}${name}${R}${DIM}(${argStr})${R}\n`);
+    process.stdout.write(`${DIM}  Result:${R}\n`);
+    for (const line of preview.split("\n").slice(0, 12)) {
+      process.stdout.write(`    ${line}\n`);
+    }
+    process.stdout.write("\n");
   },
 
   info(msg) {

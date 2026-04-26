@@ -33,6 +33,62 @@ osiris --once "What is 2+2?"   # single message, then exit
 
 ---
 
+## Security
+
+osiris includes three built-in security features for safe tool use and API access.
+
+### Tool sandbox
+
+By default, all filesystem tools (`read`, `write`, `find`, etc.) are **sandboxed to the current working directory**. The LLM cannot read or write files outside this boundary.
+
+```bash
+osiris --tool-sandbox /safe/path   # restrict tools to a specific directory
+osiris --tool-sandbox off          # disable sandboxing (not recommended)
+```
+
+Or in config:
+```json
+{ "toolSandbox": "/home/user/projects" }
+```
+
+### Rate limiting
+
+Prevent accidental API flooding with a configurable rate limiter (token-bucket algorithm with burst allowance):
+
+```bash
+osiris --rate-limit 30   # max 30 requests per minute
+```
+
+Or in config:
+```json
+{ "rateLimit": 60 }
+```
+
+Set to `0` (default) to disable.
+
+### API key support
+
+For remote LM Studio instances that require authentication:
+
+```bash
+osiris --api-key "your-secret-key"
+```
+
+Or in config:
+```json
+{ "apiKey": "your-secret-key" }
+```
+
+The key is sent as a `Bearer` token in the `Authorization` header and is never logged.
+
+### Retry on transient errors
+
+All HTTP requests automatically retry up to 3 times with exponential backoff on:
+- HTTP 429 (rate limited), 500, 502, 503, 504
+- Network errors: `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`
+
+---
+
 ## Configuration
 
 osiris uses a **layered config system**. Settings are merged in this order — later sources override earlier ones:
@@ -56,11 +112,13 @@ Put settings you want everywhere on this machine. This is also where you set `se
 {
   "baseUrl": "http://192.168.1.50:1234/v1",
   "stream": true,
-  "template": "fancy"
+  "template": "fancy",
+  "apiKey": "your-secret-key",
+  "rateLimit": 30
 }
 ```
 
-**Example — local setup with a fixed model:**
+**Example — local setup with a fixed model and sandboxed tools:**
 
 ```json
 {
@@ -68,7 +126,8 @@ Put settings you want everywhere on this machine. This is also where you set `se
   "model": "lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF",
   "stream": true,
   "temperature": 0.3,
-  "searchDepth": 5
+  "searchDepth": 5,
+  "toolSandbox": "/home/user/projects"
 }
 ```
 
@@ -113,6 +172,9 @@ osiris will never read config files outside your home directory (`~`), regardles
 | `history` | string | none | Path to conversation history JSON file |
 | `template` | string | `"default"` | Display template name |
 | `searchDepth` | number | `3` | **Root config only.** How many parent directories to search for `.osiris.json` |
+| `apiKey` | string | none | Bearer token for remote LM Studio instances |
+| `rateLimit` | number | `0` | Max requests per minute (`0` = unlimited) |
+| `toolSandbox` | string | `cwd` | Sandbox root for tools (`"off"` to disable) |
 
 ---
 
@@ -124,6 +186,7 @@ All config keys can also be set via CLI flag — flags always win over config fi
 osiris [--base-url URL] [--model NAME] [--system PROMPT]
        [--temperature N] [--max-tokens N] [--timeout SECONDS]
        [--stream] [--history FILE] [--once "message"] [--template NAME]
+       [--api-key KEY] [--rate-limit RPM] [--tool-sandbox PATH]
 ```
 
 Environment variables `LMSTUDIO_BASE_URL` and `LMSTUDIO_MODEL` are also supported.
@@ -160,6 +223,9 @@ Or in any config file:
 | `/reset` | Clear conversation, keep system prompt |
 | `/save` | Save history to file (requires `--history`) |
 | `/history` | Print full message list as JSON |
+| `/status` | Show session stats (tokens, requests, uptime, sandbox info) |
+| `/models` | Browse and switch loaded models |
+| `/design` | Switch display template at runtime |
 
 ---
 

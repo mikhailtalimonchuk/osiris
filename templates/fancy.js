@@ -99,6 +99,7 @@ export default {
       `${DIM}model  ${R}${model}`,
       `${DIM}${"─".repeat(w - 6)}${R}`,
       `${DIM}tip: type ${R}/  ${DIM}+ enter to pick a command  ·  tab to autocomplete${R}`,
+      `${DIM}tip: start a message with ${R}#  ${DIM}to reset context${R}`,
     ], CYAN);
     process.stdout.write("\n");
   },
@@ -130,13 +131,15 @@ export default {
   },
 
   toolCall({ name, args, result }) {
-    const w = cols();
-    const argStr = JSON.stringify(args);
-    const preview = result.length > 200 ? result.slice(0, 200) + "…" : result;
+    const resultLines = result.split("\n").filter(Boolean);
+    const preview = resultLines[0]?.slice(0, 60) ?? "";
+    const more = resultLines.length > 1 ? `  ${DIM}+${resultLines.length - 1} lines${R}` : "";
+    const argStr = Object.entries(args).map(([k, v]) =>
+      `${DIM}${k}=${R}${JSON.stringify(v)}`
+    ).join("  ");
     drawBox([
-      `${YELLOW}⚙${R} ${BOLD}${name}${R}  ${DIM}${argStr}${R}`,
-      `${DIM}${"─".repeat(w - 6)}${R}`,
-      ...preview.split("\n").slice(0, 12).map(l => `${DIM}${l}${R}`),
+      `${YELLOW}⚙${R} ${BOLD}${name}${R}  ${argStr}`,
+      `${DIM}→${R}  ${preview}${more}`,
     ], YELLOW);
   },
 

@@ -20,6 +20,10 @@ export function parseArgs(argv) {
     once:        null,
     template:    "default",
     debug:       false,
+    // Security
+    apiKey:      null,
+    rateLimit:   0,          // 0 = unlimited
+    toolSandbox: null,       // null = cwd, "off" = disabled, string = custom root
   };
   const explicit = new Set();
 
@@ -38,6 +42,10 @@ export function parseArgs(argv) {
     else if (a === "--history")         { args.history     = nextVal(it, a);                            explicit.add("history");     }
     else if (a === "--once")            { args.once        = nextVal(it, a);                            explicit.add("once");        }
     else if (a === "--template")        { args.template    = nextVal(it, a);                            explicit.add("template");    }
+    // Security flags
+    else if (a === "--api-key")         { args.apiKey      = nextVal(it, a);                            explicit.add("apiKey");      }
+    else if (a === "--rate-limit")      { args.rateLimit   = Number(nextVal(it, a));                    explicit.add("rateLimit");   }
+    else if (a === "--tool-sandbox")    { args.toolSandbox = nextVal(it, a);                            explicit.add("toolSandbox"); }
     else process.stderr.write(`Unknown option: ${a}\n`);
   }
   return { args, explicit };
@@ -51,6 +59,11 @@ Usage:
   osiris [--stream] [--history FILE] [--base-url URL] [--model NAME]
          [--system PROMPT] [--temperature N] [--max-tokens N]
          [--timeout SECONDS] [--once "message"] [--template NAME]
+
+Security:
+  --api-key KEY        Bearer token for remote LM Studio instances
+  --rate-limit RPM     Max requests per minute (0 = unlimited, default: 0)
+  --tool-sandbox PATH  Restrict tool access to PATH (default: cwd; "off" to disable)
 
 Defaults:
   --base-url   ${DEFAULT_BASE_URL}

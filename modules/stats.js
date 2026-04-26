@@ -1,6 +1,8 @@
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { safeSync, safeAsync } from "./errorHandler.js";
 
 const DEFAULT_STATUS_DIR = path.join(os.homedir(), ".osiris", "status");
 
@@ -13,22 +15,90 @@ function dayKey(ts = Date.now()) {
 }
 
 function dayFile(statusDir, date) {
-  return path.join(statusDir, `${date}.json`);
+  return path.join(statusDir, `${date}.jsonl`);
+}
+
+// ── In-memory buffer to reduce disk I/O ──────────────────────────────────────
+// Entries are buffered in memory and flushed to disk periodically (every 5s)
+// or when explicitly flushed. This avoids read-modify-write on every request.
+
+const statBuffer = [];
+const FLUSH_INTERVAL_MS = 5_000;
+let _flushTimer = null;
+let _pendingFlush = null;
+
+function scheduleFlush() {
+  if (_flushTimer) return; // already scheduled
+  _flushTimer = setTimeout(flushBuffer, FLUSH_INTERVAL_MS);
+  // Use unref so the timer doesn't keep the process alive on exit
+  if (_flushTimer.unref) _flushTimer.unref();
+}
+
+async function flushBuffer() {
+  _flushTimer = null;
+  if (statBuffer.length === 0) return;
+
+  const entries = statBuffer.splice(0);
+  if (!entries.length) return;
+
+  // Group entries by date so we can append to the right file
+  const byDate = new Map();
+  for (const entry of entries) {
+    const date = dayKey(entry.timestamp);
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push(entry);
+  }
+
+  // Write all entries as JSONL (one JSON object per line) — append-only, no read
+  const writes = [];
+  for (const [date, dayEntries] of byDate) {
+    const file = dayFile(getStatusDir(), date);
+    const lines = dayEntries.map(e => JSON.stringify(e));
+    const content = lines.join("\n") + "\n";
+    writes.push(
+      fsPromises.mkdir(getStatusDir(), { recursive: true }).then(
+        () => fsPromises.appendFile(file, content, "utf8")
+      )
+    );
+  }
+
+  try {
+    await Promise.all(writes);
+  } catch (e) {
+    // Non-fatal: log but don't crash
+    console.error(`[stats] flush failed: ${e.message}`);
+  }
+}
+
+/**
+ * Flush any buffered stat entries to disk.
+ * Call this before exit to ensure no data is lost.
+ */
+export async function flushStats() {
+  if (_flushTimer) {
+    clearTimeout(_flushTimer);
+    _flushTimer = null;
+  }
+  await flushBuffer();
 }
 
 function loadDayEntries(filePath) {
   if (!fs.existsSync(filePath)) return [];
   try {
     const raw = fs.readFileSync(filePath, "utf8");
-    const data = JSON.parse(raw);
-    return Array.isArray(data) ? data : [];
+    const lines = raw.split("\n").filter(Boolean);
+    const entries = [];
+    for (const line of lines) {
+      try {
+        entries.push(JSON.parse(line));
+      } catch { /* skip malformed lines */ }
+    }
+    return entries;
   } catch { return []; }
 }
 
 export function appendStat(statusDir, entry) {
-  const file = dayFile(statusDir, dayKey());
-  const entries = loadDayEntries(file);
-  entries.push({
+  const normalized = {
     timestamp: Date.now(),
     model: entry.model ?? "",
     promptTokens: entry.promptTokens ?? 0,
@@ -36,9 +106,20 @@ export function appendStat(statusDir, entry) {
     totalTokens: entry.totalTokens ?? 0,
     elapsedMs: entry.elapsedMs ?? 0,
     tokensPerSec: entry.tokensPerSec ?? 0,
-  });
-  fs.mkdirSync(statusDir, { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(entries, null, 2), "utf8");
+  };
+
+  // Buffer in memory instead of writing immediately
+  statBuffer.push(normalized);
+  scheduleFlush();
+}
+
+/**
+ * Append a stat entry without throwing — logs errors instead.
+ * Use this for non-critical background stat tracking.
+ */
+export function appendStatSafe(statusDir, entry) {
+  // Buffering is inherently non-blocking; just push to buffer
+  appendStat(statusDir, entry);
 }
 
 function daysBack(n) {
@@ -59,7 +140,7 @@ function loadEntries(statusDir, period) {
   } else { // "all"
     try {
       dates = fs.readdirSync(statusDir)
-        .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+        .filter(f => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f))
         .map(f => f.slice(0, 10));
     } catch { return []; }
   }

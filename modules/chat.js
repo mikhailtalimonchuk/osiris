@@ -1,20 +1,106 @@
 import axios from "axios";
 import os from "node:os";
-import dns from "dns"; // force IPv4 — LM Studio on localhost doesn't always respond on IPv6
+import dns from "dns";
 import http from "http";
+import https from "https";
 import { logger } from "./logger.js";
+
+// ── Retry with exponential backoff ───────────────────────────────────────────
+
+const RETRYABLE_STATUS = [429, 500, 502, 503, 504];
+
+async function withRetry(fn, maxRetries = 3, baseDelayMs = 1000) {
+  let lastErr;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const isRetryable = RETRYABLE_STATUS.includes(e?.response?.status);
+      const isNetworkError = e?.code === "ECONNRESET" || e?.code === "ETIMEDOUT" || e?.code === "ECONNREFUSED";
+      if ((isRetryable || isNetworkError) && attempt < maxRetries) {
+        const delay = baseDelayMs * Math.pow(2, attempt);
+        logger.warn("retry", `attempt ${attempt + 1}/${maxRetries} failed — retrying in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ── Shared connection pool ───────────────────────────────────────────────────
+// Reuse TCP connections across requests instead of creating a new agent each time.
+
+const sharedHttpAgent = new http.Agent({
+  family: 4,
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 16,
+  maxFreeSockets: 8,
+});
+
+const sharedHttpsAgent = new https.Agent({
+  family: 4,
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 16,
+  maxFreeSockets: 8,
+});
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 export function urlJoin(baseUrl, p) {
   return baseUrl.replace(/\/+$/, "") + "/" + p.replace(/^\/+/, "");
 }
 
-export async function fetchFirstModel(baseUrl, timeoutMs) {
+function apiRoot(baseUrl) {
+  return baseUrl.replace(/\/v1\/?$/, "").replace(/\/$/, "");
+}
+
+export function getApiRoot(baseUrl) {
+  return apiRoot(baseUrl);
+}
+
+function httpErr(e) {
+  if (e.response) {
+    const body = typeof e.response.data === "object"
+      ? JSON.stringify(e.response.data)
+      : String(e.response.data ?? "");
+    return new Error(`HTTP ${e.response.status} ${e.response.statusText}${body ? `: ${body}` : ""}`);
+  }
+  return e;
+}
+
+function makeStats(usage, elapsedMs) {
+  const promptTokens      = usage?.prompt_tokens     ?? 0;
+  const completionTokens  = usage?.completion_tokens ?? 0;
+  const totalTokens       = usage?.total_tokens      ?? (promptTokens + completionTokens);
+  const tokensPerSec      = completionTokens && elapsedMs > 0
+    ? Math.round(completionTokens / (elapsedMs / 1000) * 10) / 10
+    : 0;
+  return { elapsedMs, promptTokens, completionTokens, totalTokens, tokensPerSec };
+}
+
+/** Build common axios config with optional API key and IPv4 forcing */
+function axiosConfig(timeoutMs, apiKey) {
+  const cfg = { timeout: timeoutMs, proxy: false };
+  if (apiKey) cfg.headers = { Authorization: `Bearer ${apiKey}` };
+  dns.setDefaultResultOrder("ipv4first");
+  // Reuse shared agents for connection pooling
+  cfg.httpAgent = sharedHttpAgent;
+  cfg.httpsAgent = sharedHttpsAgent;
+  return cfg;
+}
+
+// ── Model endpoints ──────────────────────────────────────────────────────────
+
+export async function fetchFirstModel(baseUrl, timeoutMs, apiKey) {
   const url = urlJoin(baseUrl, "/models");
   logger.step("models", `GET ${url} (timeout: ${timeoutMs}ms)`);
   try {
-    dns.setDefaultResultOrder("ipv4first");
-    const agent = new http.Agent({ family: 4, keepAlive: true });
-    const res = await axios.get(url, { timeout: timeoutMs, httpAgent: agent, proxy: false });
+    const res = await withRetry(() => axios.get(url, axiosConfig(timeoutMs, apiKey)));
     const models = res.data?.data ?? [];
     logger.ok("models", `HTTP ${res.status} — ${models.length} model(s) returned`);
     if (!models.length) {
@@ -36,20 +122,10 @@ export async function fetchFirstModel(baseUrl, timeoutMs) {
   }
 }
 
-function makeStats(usage, elapsedMs) {
-  const promptTokens      = usage?.prompt_tokens     ?? 0;
-  const completionTokens  = usage?.completion_tokens ?? 0;
-  const totalTokens       = usage?.total_tokens      ?? (promptTokens + completionTokens);
-  const tokensPerSec      = completionTokens && elapsedMs > 0
-    ? Math.round(completionTokens / (elapsedMs / 1000) * 10) / 10
-    : 0;
-  return { elapsedMs, promptTokens, completionTokens, totalTokens, tokensPerSec };
-}
-
-export async function fetchAllModels(baseUrl, timeoutMs) {
+export async function fetchAllModels(baseUrl, timeoutMs, apiKey) {
   const url = urlJoin(baseUrl, "/models");
   try {
-    const res = await axios.get(url, { timeout: timeoutMs, proxy: false });
+    const res = await withRetry(() => axios.get(url, axiosConfig(timeoutMs, apiKey)));
     const models = res.data?.data ?? [];
     return models.map(m => m.id).filter(Boolean);
   } catch {
@@ -57,45 +133,26 @@ export async function fetchAllModels(baseUrl, timeoutMs) {
   }
 }
 
-// Strip /v1 suffix to reach the LM Studio-native /api/v0 endpoints
-function apiRoot(baseUrl) {
-  return baseUrl.replace(/\/v1\/?$/, "").replace(/\/$/, "");
-}
-
-export function getApiRoot(baseUrl) {
-  return apiRoot(baseUrl);
-}
-
-function httpErr(e) {
-  if (e.response) {
-    const body = typeof e.response.data === "object"
-      ? JSON.stringify(e.response.data)
-      : String(e.response.data ?? "");
-    return new Error(`HTTP ${e.response.status} ${e.response.statusText}${body ? `: ${body}` : ""}`);
-  }
-  return e;
-}
-
-export async function fetchAvailableModels(baseUrl, timeoutMs) {
+export async function fetchAvailableModels(baseUrl, timeoutMs, apiKey) {
   const url = apiRoot(baseUrl) + "/api/v0/models";
   logger.step("models", `GET ${url}`);
   try {
-    const res = await axios.get(url, { timeout: timeoutMs, proxy: false });
+    const res = await withRetry(() => axios.get(url, axiosConfig(timeoutMs, apiKey)));
     const models = res.data?.data ?? [];
     logger.ok("models", `${models.length} model(s) from /api/v0/models`);
     logger.json("models:available", models.map(m => ({ id: m.path ?? m.id, state: m.state })));
     return models.map(m => m.path ?? m.id).filter(Boolean);
   } catch (e) {
     logger.fail("models", `/api/v0/models failed: ${e.message} — falling back to /v1/models`);
-    return fetchAllModels(baseUrl, timeoutMs);
+    return fetchAllModels(baseUrl, timeoutMs, apiKey);
   }
 }
 
-export async function unloadModel(baseUrl, modelId, timeoutMs) {
+export async function unloadModel(baseUrl, modelId, timeoutMs, apiKey) {
   const url = apiRoot(baseUrl) + "/api/v1/models/unload";
   logger.step("models", `POST ${url}  identifier=${modelId}`);
   try {
-    const res = await axios.post(url, { instance_id: modelId }, { timeout: timeoutMs, proxy: false });
+    const res = await withRetry(() => axios.post(url, { instance_id: modelId }, axiosConfig(timeoutMs, apiKey)));
     logger.ok("models", `unload HTTP ${res.status}`);
   } catch (e) {
     logger.fail("models", `unload failed: ${e.message}`);
@@ -103,12 +160,12 @@ export async function unloadModel(baseUrl, modelId, timeoutMs) {
   }
 }
 
-export async function loadModel(baseUrl, modelId) {
+export async function loadModel(baseUrl, modelId, apiKey) {
   const url = apiRoot(baseUrl) + "/api/v1/models/load";
   logger.step("models", `POST ${url}  path=${modelId}`);
   try {
-    // No timeout — loading a large GGUF can take several minutes
-    const res = await axios.post(url, { model: modelId }, { timeout: 0, proxy: false });
+    const cfg = axiosConfig(0, apiKey); // no timeout for large GGUF loads
+    const res = await withRetry(() => axios.post(url, { model: modelId }, cfg));
     logger.ok("models", `load HTTP ${res.status}`);
   } catch (e) {
     logger.fail("models", `load failed: ${e.message}`);
@@ -116,7 +173,9 @@ export async function loadModel(baseUrl, modelId) {
   }
 }
 
-export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs, tools, onFirstChunk }) {
+// ── Chat ─────────────────────────────────────────────────────────────────────
+
+export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs, tools, onFirstChunk, onFirstContent, apiKey, rateLimiter }) {
   const url = urlJoin(baseUrl, "/chat/completions");
   const body = {
     model, messages, temperature, stream,
@@ -127,14 +186,18 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
 
   logger.step("chat", `POST ${url}`);
   logger.json("chat:request", { model, temperature, stream, maxTokens, tools: tools?.length ?? 0, messageCount: messages.length });
+  logger.json("chat:messages", { messages: JSON.stringify(messages) });
+
+  // Rate-limit gate
+  await rateLimiter?.acquire();
 
   const startTime = Date.now();
   let res;
   try {
-    res = await axios.post(url, body, {
-      timeout: timeoutMs,
+    res = await withRetry(() => axios.post(url, body, {
+      ...axiosConfig(timeoutMs, apiKey),
       responseType: stream ? "stream" : "json",
-    });
+    }));
   } catch (e) {
     if (e.response) {
       const msg = `HTTP ${e.response.status}: ${JSON.stringify(e.response.data) || e.response.statusText}`;
@@ -157,8 +220,8 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
   }
 
   // SSE streaming — accumulate both content and tool_call deltas
-  let buf = "", full = "", usage = null, firstChunkFired = false;
-  const tcMap = {}; // index → { id, function: { name, arguments } }
+  let buf = "", full = "", usage = null, firstChunkFired = false, firstContentFired = false;
+  const tcMap = {};
 
   for await (const chunk of res.data) {
     buf += chunk.toString("utf8");
@@ -184,7 +247,6 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
       const choice = obj?.choices?.[0];
       if (!choice) continue;
 
-      // Accumulate tool_call deltas
       for (const tc of choice.delta?.tool_calls ?? []) {
         const idx = tc.index ?? 0;
         if (!tcMap[idx]) tcMap[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
@@ -194,7 +256,11 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
       }
 
       const delta = choice.delta?.content;
-      if (delta) { process.stdout.write(delta); full += delta; }
+      if (delta) {
+        if (!firstContentFired) { firstContentFired = true; onFirstContent?.(); }
+        process.stdout.write(delta);
+        full += delta;
+      }
     }
   }
 

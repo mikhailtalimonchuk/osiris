@@ -3,11 +3,13 @@ import { logger }                                    from "../modules/logger.js"
 import { loadConfig }                                from "../modules/config.js";
 import { parseArgs, helpText }                       from "../modules/args.js";
 import { chatOnce, fetchFirstModel, fetchAllModels, fetchAvailableModels, unloadModel, loadModel, getApiRoot } from "../modules/chat.js";
-import { TOOLS, executeTool } from "../modules/tools.js";
-import { loadHistory, saveHistory }                  from "../modules/history.js";
+import { TOOLS, executeTool, configureToolSandbox, getSandboxInfo } from "../modules/tools.js";
+import { loadHistory, saveHistory, saveHistorySafe } from "../modules/history.js";
 import { select }                                    from "../modules/selector.js";
-import { createAsk }                                 from "../modules/input.js";
-import { appendStat, getStatusDir }                  from "../modules/stats.js";
+import { createAsk, loadCommandHistory, saveCommandHistory } from "../modules/input.js";
+import { appendStatSafe, getStatusDir, flushStats }  from "../modules/stats.js";
+import { RateLimiter }                               from "../modules/rateLimiter.js";
+import { userMessage }                               from "../modules/errorHandler.js";
 
 const COMMANDS = ["/exit", "/reset", "/history", "/save", "/status", "/models", "/design"];
 
@@ -21,6 +23,10 @@ const CONFIG_MAP = [
   ["timeout",     "timeoutMs",   v => Math.floor(Number(v) * 1000)],
   ["history",     "history",     v => v],
   ["template",    "template",    v => v],
+  // Security config keys
+  ["apiKey",      "apiKey",      v => v],
+  ["rateLimit",   "rateLimit",   v => Number(v)],
+  ["toolSandbox", "toolSandbox", v => v],
 ];
 
 const AVAILABLE_TEMPLATES = ["default", "fancy", "minimal"];
@@ -37,7 +43,7 @@ function startSpinner(label) {
   return () => { clearInterval(iv); process.stdout.write("\r\x1b[2K"); };
 }
 
-async function runWithTools({ args, messages, tpl }) {
+async function runWithTools({ args, messages, tpl, rateLimiter }) {
   const msgs      = [...messages]; // working copy — caller's array is not modified here
   const toolMsgs  = [];            // intermediate messages to add to history after
 
@@ -50,9 +56,11 @@ async function runWithTools({ args, messages, tpl }) {
       ...args,
       messages: msgs,
       tools: TOOLS,
-      // In stream mode: stop spinner and open box border on first server chunk
-      onFirstChunk: () => {
-        tpl.thinkingStop?.();
+      rateLimiter,
+      // Stop spinner when server first responds (even if tool-only, no text yet)
+      onFirstChunk: () => { tpl.thinkingStop?.(); },
+      // Open stream border only when actual text content begins flowing
+      onFirstContent: () => {
         if (!streamOpen) { tpl.streamStart?.(); streamOpen = true; }
       },
     });
@@ -70,7 +78,8 @@ async function runWithTools({ args, messages, tpl }) {
       for (const call of toolCalls) {
         let callArgs;
         try { callArgs = JSON.parse(call.function.arguments); } catch { callArgs = {}; }
-        const result = executeTool(call.function.name, callArgs);
+        // Tools are now async — await them so the event loop isn't blocked
+        const result = await executeTool(call.function.name, callArgs);
         tpl.toolCall?.({ name: call.function.name, args: callArgs, result });
         const toolMsg = { role: "tool", tool_call_id: call.id, content: result };
         msgs.push(toolMsg);
@@ -97,6 +106,39 @@ async function loadTemplate(name) {
   }
 }
 
+// ── Graceful shutdown ────────────────────────────────────────────────────────
+
+let _pendingMessages = null;
+let _pendingHistory  = null;
+let _shuttingDown    = false;
+
+function updatePendingState(messages, historyPath) {
+  _pendingMessages = messages;
+  _pendingHistory  = historyPath;
+}
+
+async function onShutdown() {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+
+  // Flush any buffered stats to disk before exiting
+  await flushStats();
+  // Persist command-line history (up/down arrows) to disk
+  saveCommandHistory();
+  if (_pendingHistory && _pendingMessages) {
+    try {
+      await saveHistory(_pendingHistory, _pendingMessages);
+      logger.ok("shutdown", `history saved to ${_pendingHistory}`);
+    } catch (e) {
+      logger.error("shutdown", `failed to save history: ${e?.message ?? String(e)}`);
+    }
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT",  onShutdown);
+process.on("SIGTERM", onShutdown);
+
 async function run() {
   const { args, explicit } = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -107,7 +149,8 @@ async function run() {
   // Enable debug logger as early as possible so every subsequent step is visible
   if (args.debug) {
     logger.enable();
-    logger.step("debug", "debug mode enabled");
+    logger.setLogFile(".osiris-debug.log");
+    logger.step("debug", "debug mode enabled — logging to .osiris-debug.log");
     logger.json("args:cli", { ...args, debug: true });
     logger.json("args:explicit", [...explicit]);
   }
@@ -121,6 +164,30 @@ async function run() {
     }
   }
   logger.json("args:final", args);
+
+  // ── Security: configure tool sandbox ──────────────────────────────────────
+  const sandboxMode = args.toolSandbox ?? config.toolSandbox;
+  if (sandboxMode) {
+    configureToolSandbox(sandboxMode);
+    logger.ok("security", `tool sandbox configured: ${JSON.stringify(getSandboxInfo())}`);
+  } else {
+    configureToolSandbox(process.cwd());
+    logger.ok("security", `tool sandbox: default (cwd)`);
+  }
+
+  // ── Security: configure rate limiter ──────────────────────────────────────
+  const rpm = args.rateLimit ?? 0;
+  const rateLimiter = rpm > 0 ? new RateLimiter(rpm) : null;
+  if (rateLimiter) {
+    logger.ok("security", `rate limiter: ${rpm} req/min`);
+  } else {
+    logger.step("security", "rate limiter: disabled");
+  }
+
+  // ── Security: API key ─────────────────────────────────────────────────────
+  if (args.apiKey) {
+    logger.ok("security", "API key configured (hidden)");
+  }
 
   // Load the display template before doing any I/O
   logger.step("template", `loading template: "${args.template}"`);
@@ -136,7 +203,7 @@ async function run() {
   // Auto-detect model if not provided
   if (!args.model) {
     logger.step("models", `no model set — querying ${args.baseUrl}`);
-    args.model = await fetchFirstModel(args.baseUrl, args.timeoutMs);
+    args.model = await fetchFirstModel(args.baseUrl, args.timeoutMs, args.apiKey);
     if (!args.model) {
       tpl.error("Cannot load model in LM Studio. Load a model or pass --model.");
       process.exit(1);
@@ -145,6 +212,9 @@ async function run() {
   } else {
     logger.ok("models", `model set explicitly: ${args.model}`);
   }
+
+  // Load command-line history (up/down arrow) from disk
+  loadCommandHistory();
 
   // Build the initial message list (load history if requested)
   let messages = [{ role: "system", content: args.system }];
@@ -165,6 +235,8 @@ async function run() {
       tpl.error(`Failed to load history: ${e?.message ?? String(e)}`);
       process.exit(2);
     }
+    // Track state for signal-handled shutdown
+    updatePendingState(messages, args.history);
   }
 
   // Stats directory — one file per day under ~/.osiris/status/
@@ -173,16 +245,23 @@ async function run() {
   // Non-interactive single-shot mode
   if (args.once) {
     logger.step("run", `--once mode: "${args.once}"`);
+    logger.input(args.once);
     messages.push({ role: "user", content: args.once });
     try {
-      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl });
+      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl, rateLimiter });
+      logger.output(assistant);
       for (const m of toolMsgs) messages.push(m);
       messages.push({ role: "assistant", content: assistant });
-      if (args.history) { try { saveHistory(args.history, messages); } catch {} }
-      // Persist stats
-      try { appendStat(statusDir, { model: args.model, ...stats }); } catch {}
+      // Update pending state so signal handler can save
+      updatePendingState(messages, args.history);
+      // Save history (non-fatal — logs error if it fails)
+      if (args.history) await saveHistorySafe(args.history, messages);
+      // Persist stats (non-fatal — logs error if it fails)
+      appendStatSafe(statusDir, { model: args.model, ...stats });
+      // Flush stats buffer before exiting
+      await flushStats();
     } catch (e) {
-      tpl.error(`Request failed: ${e?.message ?? String(e)}`);
+      tpl.error(`Request failed: ${userMessage(e)}`);
       process.exit(1);
     }
     return;
@@ -207,10 +286,14 @@ async function run() {
 
     if (!user) continue;
 
+    // Log user input in debug mode
+    logger.input(user);
+
     if (user === "/exit" || user === "/quit") break;
 
     if (user === "/reset") {
       messages = [{ role: "system", content: args.system }];
+      updatePendingState(messages, args.history);
       tpl.info("history reset");
       continue;
     }
@@ -223,16 +306,17 @@ async function run() {
     if (user === "/save") {
       if (!args.history) { tpl.info("no --history path provided"); continue; }
       try {
-        saveHistory(args.history, messages);
+        await saveHistory(args.history, messages);
         tpl.info(`saved to ${args.history}`);
       } catch (e) {
-        tpl.error(`failed to save: ${e?.message ?? String(e)}`);
+        tpl.error(`failed to save: ${userMessage(e)}`);
       }
       continue;
     }
 
     if (user === "/status") {
-      await tpl.status?.({ sessionStart, sessionStats, model: args.model, baseUrl: args.baseUrl, statusDir });
+      const rateInfo = rateLimiter ? { rpm: args.rateLimit, remaining: rateLimiter.remaining } : { rpm: "unlimited" };
+      await tpl.status?.({ sessionStart, sessionStats, model: args.model, baseUrl: args.baseUrl, statusDir, sandbox: getSandboxInfo(), rateLimit: rateInfo });
       continue;
     }
 
@@ -241,7 +325,7 @@ async function run() {
 
       const stopFetch = startSpinner("fetching available models");
       let models;
-      try { models = await fetchAvailableModels(args.baseUrl, args.timeoutMs); }
+      try { models = await fetchAvailableModels(args.baseUrl, args.timeoutMs, args.apiKey); }
       finally { stopFetch(); }
 
       if (!models.length) { tpl.error("No models returned — check LM Studio version supports /api/v0/models"); continue; }
@@ -252,23 +336,23 @@ async function run() {
 
       let stopSpinner = startSpinner(`unloading  ${args.model}`);
       try {
-        await unloadModel(args.baseUrl, args.model, args.timeoutMs);
+        await unloadModel(args.baseUrl, args.model, args.timeoutMs, args.apiKey);
         stopSpinner();
         tpl.info("unloaded");
       } catch (e) {
         stopSpinner();
-        tpl.error(`Unload failed: ${e?.message ?? String(e)}`);
+        tpl.error(`Unload failed: ${userMessage(e)}`);
       }
 
       stopSpinner = startSpinner(`loading  ${picked}`);
       try {
-        await loadModel(args.baseUrl, picked);
+        await loadModel(args.baseUrl, picked, args.apiKey);
         stopSpinner();
         args.model = picked;
         tpl.info(`Model → ${picked}`);
       } catch (e) {
         stopSpinner();
-        tpl.error(`Load failed: ${e?.message ?? String(e)}`);
+        tpl.error(`Load failed: ${userMessage(e)}`);
       }
       continue;
     }
@@ -301,26 +385,48 @@ async function run() {
       continue;
     }
 
+    // ── # prefix: reset context, optionally with new message ────────────────
+    if (user.startsWith("#")) {
+      const afterHash = user.slice(1).trim();
+      messages = [{ role: "system", content: args.system }];
+      updatePendingState(messages, args.history);
+      tpl.info("context cleared");
+      // If there's text after #, treat it as the first message in the new context
+      if (afterHash) {
+        user = afterHash;
+      } else {
+        continue; // just # with no text — reset and go back to prompt
+      }
+    }
+
     messages.push({ role: "user", content: user });
     try {
-      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl });
+      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl, rateLimiter });
+      logger.output(assistant);
       for (const m of toolMsgs) messages.push(m);
       messages.push({ role: "assistant", content: assistant });
       sessionStats.requests         += 1;
       sessionStats.promptTokens     += stats.promptTokens;
       sessionStats.completionTokens += stats.completionTokens;
       sessionStats.totalTokens      += stats.totalTokens;
-      if (args.history) { try { saveHistory(args.history, messages); } catch {} }
-      // Persist stats
-      try { appendStat(statusDir, { model: args.model, ...stats }); } catch {}
+      // Update pending state so signal handler can save on SIGINT/SIGTERM
+      updatePendingState(messages, args.history);
+      // Save history (non-fatal — logs error if it fails) — now async, non-blocking
+      if (args.history) saveHistorySafe(args.history, messages);
+      // Persist stats (non-fatal — logs error if it fails) — buffered, non-blocking
+      appendStatSafe(statusDir, { model: args.model, ...stats });
     } catch (e) {
       messages.pop();
-      tpl.error(`Request failed: ${e?.message ?? String(e)}`);
+      updatePendingState(messages, args.history);
+      tpl.error(`Request failed: ${userMessage(e)}`);
     }
   }
 
   process.stdin.pause();
-  if (args.history) { try { saveHistory(args.history, messages); } catch {} }
+  // Final history save (non-fatal — logs error if it fails)
+  if (args.history) await saveHistorySafe(args.history, messages);
+  // Flush any remaining stats before exit
+  await flushStats();
 }
 
 run().catch((e) => {

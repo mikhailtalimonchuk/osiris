@@ -43,7 +43,8 @@ export default {
   prompt: "> ",
 
   welcome({ baseUrl, model }) {
-    process.stdout.write(`osiris | ${baseUrl} | ${model}\n\n`);
+    process.stdout.write(`osiris | ${baseUrl} | ${model}\n`);
+    process.stdout.write(`tip: start a message with # to reset context\n\n`);
   },
 
   thinking() { startSpinner(); },
@@ -64,6 +65,18 @@ export default {
       const elapsed = (stats.elapsedMs / 1000).toFixed(2);
       process.stdout.write(`${GREEN}${elapsed}s${R}\n`);
     }
+  },
+
+  /** Display a tool call with clear labels for each section */
+  toolCall({ name, args, result }) {
+    const argStr = JSON.stringify(args);
+    const preview = result.length > 200 ? result.slice(0, 200) + "…" : result;
+    process.stdout.write(`\nTool: ${name}(${argStr})\n`);
+    process.stdout.write(`Result:\n`);
+    for (const line of preview.split("\n").slice(0, 12)) {
+      process.stdout.write(`  ${line}\n`);
+    }
+    process.stdout.write("\n");
   },
 
   info(msg) {
