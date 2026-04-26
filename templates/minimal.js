@@ -1,6 +1,9 @@
 // Minimal template — plain text with green request time
 const GREEN = "\x1b[32m";
 const R = "\x1b[0m";
+const DIM = "\x1b[2m";
+const YELLOW = "\x1b[33m";
+const CYAN = "\x1b[36m";
 
 let spinnerInterval = null;
 
@@ -39,6 +42,14 @@ function formatDuration(ms) {
   return `${s}s`;
 }
 
+function visibleLen(s) {
+  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function cols() {
+  return Math.min(process.stdout.columns || 80, 120);
+}
+
 export default {
   prompt: "> ",
 
@@ -67,7 +78,7 @@ export default {
     }
   },
 
-  /** Display a tool call with clear labels for each section */
+  /** Legacy toolCall — used in "full" mode */
   toolCall({ name, args, result }) {
     const argStr = JSON.stringify(args);
     const preview = result.length > 200 ? result.slice(0, 200) + "…" : result;
@@ -77,6 +88,22 @@ export default {
       process.stdout.write(`  ${line}\n`);
     }
     process.stdout.write("\n");
+  },
+
+  /** Render the collapsed 1-line summary for interactive tool results */
+  renderToolCollapsed({ name, args, result, header, meta, hint }) {
+    process.stdout.write(`${header}  ${meta}  ${hint}\n`);
+  },
+
+  /** Render the expanded view content (called per-page) */
+  renderToolExpanded({ name, args, result, pageLines, page, totalPages, pageSize }) {
+    for (const line of pageLines) {
+      process.stdout.write(`  ${line}\n`);
+    }
+    const remaining = pageSize - pageLines.length;
+    for (let i = 0; i < remaining; i++) {
+      process.stdout.write(`  \n`);
+    }
   },
 
   info(msg) {

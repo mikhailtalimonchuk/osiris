@@ -3,13 +3,14 @@ import { logger }                                    from "../modules/logger.js"
 import { loadConfig }                                from "../modules/config.js";
 import { parseArgs, helpText }                       from "../modules/args.js";
 import { chatOnce, fetchFirstModel, fetchAllModels, fetchAvailableModels, unloadModel, loadModel, getApiRoot } from "../modules/chat.js";
-import { TOOLS, executeTool, configureToolSandbox, getSandboxInfo } from "../modules/tools.js";
+import { TOOLS, executeTool, configureToolSandbox, getSandboxInfo, configureToolLimits, getToolLimits } from "../modules/tools.js";
 import { loadHistory, saveHistory, saveHistorySafe } from "../modules/history.js";
 import { select }                                    from "../modules/selector.js";
 import { createAsk, loadCommandHistory, saveCommandHistory } from "../modules/input.js";
 import { appendStatSafe, getStatusDir, flushStats }  from "../modules/stats.js";
 import { RateLimiter }                               from "../modules/rateLimiter.js";
 import { userMessage }                               from "../modules/errorHandler.js";
+import { configureToolResultDisplay, displayToolResult, displayToolResultStatic } from "../modules/toolResult.js";
 
 const COMMANDS = ["/exit", "/reset", "/history", "/save", "/status", "/models", "/design"];
 
@@ -23,6 +24,11 @@ const CONFIG_MAP = [
   ["timeout",     "timeoutMs",   v => Math.floor(Number(v) * 1000)],
   ["history",     "history",     v => v],
   ["template",    "template",    v => v],
+  // Tool limit config keys
+  ["toolFindMaxResults", "toolFindMaxResults", v => Number(v)],
+  ["toolReadMaxLines",   "toolReadMaxLines",   v => Number(v)],
+  // Tool result display mode
+  ["toolResultMode", "toolResultMode", v => v],
   // Security config keys
   ["apiKey",      "apiKey",      v => v],
   ["rateLimit",   "rateLimit",   v => Number(v)],
@@ -43,7 +49,7 @@ function startSpinner(label) {
   return () => { clearInterval(iv); process.stdout.write("\r\x1b[2K"); };
 }
 
-async function runWithTools({ args, messages, tpl, rateLimiter }) {
+async function runWithTools({ args, messages, tpl, rateLimiter, toolResultMode }) {
   const msgs      = [...messages]; // working copy — caller's array is not modified here
   const toolMsgs  = [];            // intermediate messages to add to history after
 
@@ -80,7 +86,29 @@ async function runWithTools({ args, messages, tpl, rateLimiter }) {
         try { callArgs = JSON.parse(call.function.arguments); } catch { callArgs = {}; }
         // Tools are now async — await them so the event loop isn't blocked
         const result = await executeTool(call.function.name, callArgs);
-        tpl.toolCall?.({ name: call.function.name, args: callArgs, result });
+
+        // Display tool result using the configured mode
+        if (toolResultMode === "full") {
+          // Always show full result — use template's toolCall if available, else static
+          if (tpl.toolCall) {
+            tpl.toolCall({ name: call.function.name, args: callArgs, result });
+          } else {
+            displayToolResultStatic({ name: call.function.name, args: callArgs, result });
+          }
+        } else if (toolResultMode === "static") {
+          // Non-interactive: summary + preview
+          displayToolResultStatic({ name: call.function.name, args: callArgs, result });
+        } else {
+          // Interactive: collapsed summary, press Enter to expand inline
+          await displayToolResult({
+            name: call.function.name,
+            args: callArgs,
+            result,
+            renderCollapsed: tpl.renderToolCollapsed,
+            renderExpanded: tpl.renderToolExpanded,
+          });
+        }
+
         const toolMsg = { role: "tool", tool_call_id: call.id, content: result };
         msgs.push(toolMsg);
         toolMsgs.push(toolMsg);
@@ -165,6 +193,18 @@ async function run() {
   }
   logger.json("args:final", args);
 
+  // ── Tool limits: configure from resolved args ─────────────────────────────
+  configureToolLimits({
+    findMaxResults: args.toolFindMaxResults,
+    readMaxLines:   args.toolReadMaxLines,
+  });
+  logger.ok("tools", `tool limits configured: ${JSON.stringify(getToolLimits())}`);
+
+  // ── Tool result display mode ──────────────────────────────────────────────
+  const toolResultMode = args.toolResultMode ?? "interactive";
+  configureToolResultDisplay(toolResultMode);
+  logger.ok("tools", `tool result mode: ${toolResultMode}`);
+
   // ── Security: configure tool sandbox ──────────────────────────────────────
   const sandboxMode = args.toolSandbox ?? config.toolSandbox;
   if (sandboxMode) {
@@ -248,7 +288,7 @@ async function run() {
     logger.input(args.once);
     messages.push({ role: "user", content: args.once });
     try {
-      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl, rateLimiter });
+      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl, rateLimiter, toolResultMode: "static" });
       logger.output(assistant);
       for (const m of toolMsgs) messages.push(m);
       messages.push({ role: "assistant", content: assistant });
@@ -401,7 +441,7 @@ async function run() {
 
     messages.push({ role: "user", content: user });
     try {
-      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl, rateLimiter });
+      const { text: assistant, stats, toolMsgs } = await runWithTools({ args, messages, tpl, rateLimiter, toolResultMode });
       logger.output(assistant);
       for (const m of toolMsgs) messages.push(m);
       messages.push({ role: "assistant", content: assistant });

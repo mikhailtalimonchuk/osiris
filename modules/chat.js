@@ -5,6 +5,8 @@ import http from "http";
 import https from "https";
 import { logger } from "./logger.js";
 
+dns.setDefaultResultOrder("ipv4first");
+
 // ── Retry with exponential backoff ───────────────────────────────────────────
 
 const RETRYABLE_STATUS = [429, 500, 502, 503, 504];
@@ -83,13 +85,11 @@ function makeStats(usage, elapsedMs) {
   return { elapsedMs, promptTokens, completionTokens, totalTokens, tokensPerSec };
 }
 
-/** Build common axios config with optional API key and IPv4 forcing */
+/** Build common axios config with optional API key */
 function axiosConfig(timeoutMs, apiKey) {
   const cfg = { timeout: timeoutMs, proxy: false };
   if (apiKey) cfg.headers = { Authorization: `Bearer ${apiKey}` };
-  dns.setDefaultResultOrder("ipv4first");
-  // Reuse shared agents for connection pooling
-  cfg.httpAgent = sharedHttpAgent;
+  cfg.httpAgent  = sharedHttpAgent;
   cfg.httpsAgent = sharedHttpsAgent;
   return cfg;
 }

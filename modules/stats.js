@@ -2,7 +2,6 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { safeSync, safeAsync } from "./errorHandler.js";
 
 const DEFAULT_STATUS_DIR = path.join(os.homedir(), ".osiris", "status");
 

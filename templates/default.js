@@ -46,6 +46,14 @@ function formatDuration(ms) {
   return `${s}s`;
 }
 
+function visibleLen(s) {
+  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function cols() {
+  return Math.min(process.stdout.columns || 80, 120);
+}
+
 export default {
   prompt: `${CYAN}›${R} `,
 
@@ -80,7 +88,7 @@ export default {
     process.stdout.write(`${R}\n`);
   },
 
-  /** Display a tool call with clear labels for each section */
+  /** Legacy toolCall — used in "full" mode to show entire result */
   toolCall({ name, args, result }) {
     const argStr = JSON.stringify(args);
     const preview = result.length > 200 ? result.slice(0, 200) + "…" : result;
@@ -90,6 +98,27 @@ export default {
       process.stdout.write(`    ${line}\n`);
     }
     process.stdout.write("\n");
+  },
+
+  /** Render the collapsed 1-line summary for interactive tool results */
+  renderToolCollapsed({ name, args, result, header, meta, hint }) {
+    const w = cols();
+    const content = `${header}  ${meta}  ${hint}`;
+    const pad = Math.max(0, w - 4 - visibleLen(content));
+    process.stdout.write(`${DIM}┌${R} ${content}${" ".repeat(pad)} ${DIM}┐${R}\n`);
+  },
+
+  /** Render the expanded view content (called per-page) */
+  renderToolExpanded({ name, args, result, pageLines, page, totalPages, pageSize }) {
+    const w = cols();
+    for (const line of pageLines) {
+      const pad = Math.max(0, w - 6 - visibleLen(line));
+      process.stdout.write(`  ${DIM}│${R} ${CYAN}${line}${R}${" ".repeat(pad)}\n`);
+    }
+    const remaining = pageSize - pageLines.length;
+    for (let i = 0; i < remaining; i++) {
+      process.stdout.write(`  ${DIM}│${R}\n`);
+    }
   },
 
   info(msg) {

@@ -1,3 +1,5 @@
+import { DEFAULT_TIMEOUT_MS, TOOL_FIND_MAX_RESULTS, TOOL_READ_DEFAULT_MAX_LINES } from "./constants.js";
+
 export const DEFAULT_BASE_URL = process.env.LMSTUDIO_BASE_URL ?? "http://localhost:1234/v1";
 export const DEFAULT_MODEL = process.env.LMSTUDIO_MODEL ?? null;
 
@@ -15,11 +17,16 @@ export function parseArgs(argv) {
     temperature: 0.2,
     maxTokens:   null,
     stream:      false,
-    timeoutMs:   120_000,
+    timeoutMs:   DEFAULT_TIMEOUT_MS,
     history:     null,
     once:        null,
     template:    "default",
     debug:       false,
+    // Tool limits (overridable via config)
+    toolFindMaxResults:  TOOL_FIND_MAX_RESULTS,
+    toolReadMaxLines:    TOOL_READ_DEFAULT_MAX_LINES,
+    // Tool result display mode
+    toolResultMode: "interactive",  // "interactive" | "static" | "full"
     // Security
     apiKey:      null,
     rateLimit:   0,          // 0 = unlimited
@@ -42,6 +49,11 @@ export function parseArgs(argv) {
     else if (a === "--history")         { args.history     = nextVal(it, a);                            explicit.add("history");     }
     else if (a === "--once")            { args.once        = nextVal(it, a);                            explicit.add("once");        }
     else if (a === "--template")        { args.template    = nextVal(it, a);                            explicit.add("template");    }
+    // Tool limit flags
+    else if (a === "--tool-find-max-results") { args.toolFindMaxResults = Number(nextVal(it, a));       explicit.add("toolFindMaxResults"); }
+    else if (a === "--tool-read-max-lines")   { args.toolReadMaxLines   = Number(nextVal(it, a));       explicit.add("toolReadMaxLines");   }
+    // Tool result display mode
+    else if (a === "--tool-result-mode")      { args.toolResultMode   = nextVal(it, a);                 explicit.add("toolResultMode");   }
     // Security flags
     else if (a === "--api-key")         { args.apiKey      = nextVal(it, a);                            explicit.add("apiKey");      }
     else if (a === "--rate-limit")      { args.rateLimit   = Number(nextVal(it, a));                    explicit.add("rateLimit");   }
@@ -59,6 +71,16 @@ Usage:
   osiris [--stream] [--history FILE] [--base-url URL] [--model NAME]
          [--system PROMPT] [--temperature N] [--max-tokens N]
          [--timeout SECONDS] [--once "message"] [--template NAME]
+
+Tool limits (also configurable via .osiris.json):
+  --tool-find-max-results N   Max results for find tool (default: ${TOOL_FIND_MAX_RESULTS})
+  --tool-read-max-lines N     Max lines for read tool (default: ${TOOL_READ_DEFAULT_MAX_LINES})
+
+Tool result display:
+  --tool-result-mode MODE     How tool results are shown (default: interactive)
+                              interactive  — 1-line summary, press Enter to expand inline
+                              static       — summary + preview, no interaction
+                              full         — always show full result
 
 Security:
   --api-key KEY        Bearer token for remote LM Studio instances

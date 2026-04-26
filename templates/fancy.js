@@ -130,6 +130,7 @@ export default {
     process.stdout.write(`${BLUE}╰${"─".repeat(w - 2)}╯${R}\n`);
   },
 
+  /** Legacy toolCall — used in "full" mode */
   toolCall({ name, args, result }) {
     const resultLines = result.split("\n").filter(Boolean);
     const preview = resultLines[0]?.slice(0, 60) ?? "";
@@ -141,6 +142,27 @@ export default {
       `${YELLOW}⚙${R} ${BOLD}${name}${R}  ${argStr}`,
       `${DIM}→${R}  ${preview}${more}`,
     ], YELLOW);
+  },
+
+  /** Render the collapsed 1-line summary for interactive tool results */
+  renderToolCollapsed({ name, args, result, header, meta, hint }) {
+    const w = cols();
+    const content = `${header}  ${meta}  ${hint}`;
+    const pad = " ".repeat(Math.max(0, w - 4 - visible(content)));
+    process.stdout.write(`${YELLOW}┌${R} ${content}${pad} ${YELLOW}┐${R}\n`);
+  },
+
+  /** Render the expanded view content (called per-page) */
+  renderToolExpanded({ name, args, result, pageLines, page, totalPages, pageSize }) {
+    const w = cols();
+    for (const line of pageLines) {
+      const pad = " ".repeat(Math.max(0, w - 6 - visible(line)));
+      process.stdout.write(`  ${YELLOW}│${R} ${CYAN}${line}${R}${pad}\n`);
+    }
+    const remaining = pageSize - pageLines.length;
+    for (let i = 0; i < remaining; i++) {
+      process.stdout.write(`  ${YELLOW}│${R}\n`);
+    }
   },
 
   streamEnd(stats) {

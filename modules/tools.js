@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { TOOL_FIND_MAX_RESULTS, TOOL_READ_DEFAULT_MAX_LINES } from "./constants.js";
 
 // ── Sandbox configuration ────────────────────────────────────────────────────
 // By default tools are sandboxed to process.cwd().  Override via config key
@@ -36,6 +37,28 @@ export function getSandboxInfo() {
   return { enabled: _sandboxEnabled, root: _sandboxRoot };
 }
 
+// ── Tool limits (overridable via config) ─────────────────────────────────────
+
+let _findMaxResults   = TOOL_FIND_MAX_RESULTS;
+let _readMaxLines     = TOOL_READ_DEFAULT_MAX_LINES;
+
+/**
+ * Override tool limits at runtime (called after config is loaded).
+ * Accepts a partial object — only provided keys are updated.
+ */
+export function configureToolLimits(opts = {}) {
+  if (Number.isInteger(opts.findMaxResults) && opts.findMaxResults > 0) {
+    _findMaxResults = opts.findMaxResults;
+  }
+  if (Number.isInteger(opts.readMaxLines) && opts.readMaxLines > 0) {
+    _readMaxLines = opts.readMaxLines;
+  }
+}
+
+export function getToolLimits() {
+  return { findMaxResults: _findMaxResults, readMaxLines: _readMaxLines };
+}
+
 // ── implementations (async) ──────────────────────────────────────────────────
 
 const patternCache = new Map();
@@ -58,7 +81,7 @@ async function findPaths({ pattern = "*", dir = ".", type = "any" }) {
     let entries;
     try { entries = await fs.readdir(cur, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
-      if (results.length >= 300) return;
+      if (results.length >= _findMaxResults) return;
       const full = path.join(cur, e.name);
       const isDir = e.isDirectory();
       if (re.test(e.name)) {
@@ -86,12 +109,16 @@ async function makeDir({ path: p }) {
   catch (e) { return `Error: ${e.message}`; }
 }
 
-async function readFile({ path: p, max_lines = 500 }) {
+async function readFile({ path: p, max_lines }) {
+  const effectiveMax = (max_lines != null && Number.isInteger(max_lines) && max_lines > 0)
+    ? max_lines
+    : _readMaxLines;
+
   try {
     const text = await fs.readFile(safePath(p), "utf8");
     const lines = text.split("\n");
-    return lines.length > max_lines
-      ? lines.slice(0, max_lines).join("\n") + `\n… (${lines.length - max_lines} lines truncated)`
+    return lines.length > effectiveMax
+      ? lines.slice(0, effectiveMax).join("\n") + `\n… (${lines.length - effectiveMax} lines truncated)`
       : text;
   } catch (e) { return `Error: ${e.message}`; }
 }
@@ -194,7 +221,7 @@ export const TOOLS = [
         type: "object",
         properties: {
           path:      { type: "string", description: "File path" },
-          max_lines: { type: "number", description: "Max lines to return (default: 500)" },
+          max_lines: { type: "number", description: "Max lines to return (default: configurable via toolReadMaxLines)" },
         },
         required: ["path"],
       },
