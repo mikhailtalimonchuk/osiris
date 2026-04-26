@@ -17,7 +17,6 @@ export default {
     process.stdout.write(`  ${DIM}url  ${R}${baseUrl}\n`);
     process.stdout.write(`  ${DIM}mdl  ${R}${model}\n`);
     process.stdout.write(`${sep}\n`);
-    process.stdout.write(`  ${DIM}commands: /exit  /reset  /save  /history${R}\n\n`);
   },
 
   response(text) {

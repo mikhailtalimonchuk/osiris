@@ -6,8 +6,7 @@ export default {
   prompt: "> ",
 
   welcome({ baseUrl, model }) {
-    process.stdout.write(`osiris | ${baseUrl} | ${model}\n`);
-    process.stdout.write("Commands: /exit /reset /save /history\n\n");
+    process.stdout.write(`osiris | ${baseUrl} | ${model}\n\n`);
   },
 
   response(text, stats) {

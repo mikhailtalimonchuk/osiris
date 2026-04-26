@@ -62,7 +62,6 @@ export default {
       `${DIM}url    ${R}${baseUrl}`,
       `${DIM}model  ${R}${model}`,
       `${DIM}${"─".repeat(w - 6)}${R}`,
-      `${DIM}commands: /exit  /reset  /save  /history  /status  /models${R}`,
       `${DIM}tip: type ${R}/  ${DIM}+ enter to pick a command  ·  tab to autocomplete${R}`,
     ], CYAN);
     process.stdout.write("\n");
