@@ -175,7 +175,7 @@ export async function loadModel(baseUrl, modelId, apiKey) {
 
 // ── Chat ─────────────────────────────────────────────────────────────────────
 
-export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs, tools, onFirstChunk, onFirstContent, apiKey, rateLimiter }) {
+export async function chatOnce({ baseUrl, model, messages, temperature, maxTokens, stream, timeoutMs, tools, onFirstChunk, onFirstContent, onChunk, apiKey, rateLimiter }) {
   const url = urlJoin(baseUrl, "/chat/completions");
   const body = {
     model, messages, temperature, stream,
@@ -233,7 +233,7 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
       if (!s.startsWith("data:")) continue;
       const payload = s.slice(5).trim();
       if (payload === "[DONE]") {
-        process.stdout.write(os.EOL);
+        if (!onChunk) process.stdout.write(os.EOL);
         const toolCalls = Object.keys(tcMap).length ? Object.values(tcMap) : null;
         const stats = makeStats(usage, Date.now() - startTime);
         logger.step("chat", `stream done — ${full.length} chars, tool_calls: ${toolCalls?.length ?? 0}`);
@@ -258,13 +258,13 @@ export async function chatOnce({ baseUrl, model, messages, temperature, maxToken
       const delta = choice.delta?.content;
       if (delta) {
         if (!firstContentFired) { firstContentFired = true; onFirstContent?.(); }
-        process.stdout.write(delta);
+        if (onChunk) { onChunk(delta); } else { process.stdout.write(delta); }
         full += delta;
       }
     }
   }
 
-  process.stdout.write(os.EOL);
+  if (!onChunk) process.stdout.write(os.EOL);
   const toolCalls = Object.keys(tcMap).length ? Object.values(tcMap) : null;
   const stats = makeStats(usage, Date.now() - startTime);
   logger.step("chat", `stream ended without [DONE] — ${full.length} chars total`);

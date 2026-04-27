@@ -35,7 +35,7 @@ const CONFIG_MAP = [
   ["toolSandbox", "toolSandbox", v => v],
 ];
 
-const AVAILABLE_TEMPLATES = ["default", "fancy", "minimal"];
+const AVAILABLE_TEMPLATES = ["default", "fancy", "minimal", "blessed"];
 
 function startSpinner(label) {
   const frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
@@ -49,7 +49,9 @@ function startSpinner(label) {
   return () => { clearInterval(iv); process.stdout.write("\r\x1b[2K"); };
 }
 
-async function runWithTools({ args, messages, tpl, rateLimiter, toolResultMode }) {
+async function runWithTools({ args, messages, tpl, rateLimiter, toolResultMode: configuredMode }) {
+  // Template can override the configured tool result mode (e.g. blessed forces "full")
+  const toolResultMode = tpl.toolResultMode ?? configuredMode;
   const msgs      = [...messages]; // working copy — caller's array is not modified here
   const toolMsgs  = [];            // intermediate messages to add to history after
 
@@ -69,6 +71,8 @@ async function runWithTools({ args, messages, tpl, rateLimiter, toolResultMode }
       onFirstContent: () => {
         if (!streamOpen) { tpl.streamStart?.(); streamOpen = true; }
       },
+      // Route streaming chunks to template when it supports it (e.g. blessed)
+      onChunk: tpl.onChunk ? (d) => tpl.onChunk(d) : undefined,
     });
 
     // For non-stream mode thinkingStop is not yet called; idempotent for stream
@@ -139,6 +143,7 @@ async function loadTemplate(name) {
 let _pendingMessages = null;
 let _pendingHistory  = null;
 let _shuttingDown    = false;
+let _tpl             = null; // current template (for shutdown hook)
 
 function updatePendingState(messages, historyPath) {
   _pendingMessages = messages;
@@ -152,7 +157,9 @@ async function onShutdown() {
   // Flush any buffered stats to disk before exiting
   await flushStats();
   // Persist command-line history (up/down arrows) to disk
-  saveCommandHistory();
+  // If template manages its own history (e.g. blessed), skip the default save
+  if (!_tpl?.createAsk) saveCommandHistory();
+  else _tpl.saveHistory?.();
   if (_pendingHistory && _pendingMessages) {
     try {
       await saveHistory(_pendingHistory, _pendingMessages);
@@ -161,6 +168,7 @@ async function onShutdown() {
       logger.error("shutdown", `failed to save history: ${e?.message ?? String(e)}`);
     }
   }
+  _tpl?.cleanup?.();
   process.exit(0);
 }
 
@@ -234,6 +242,7 @@ async function run() {
   let tpl;
   try {
     tpl = await loadTemplate(args.template);
+    _tpl = tpl;
     logger.ok("template", `loaded: "${args.template}"`);
   } catch (e) {
     process.stderr.write(e.message + "\n");
@@ -311,7 +320,9 @@ async function run() {
   logger.step("run", "entering interactive loop");
   tpl.welcome({ baseUrl: args.baseUrl, model: args.model });
 
-  const ask = createAsk(COMMANDS);
+  // Use template's own ask() when available (e.g. blessed TUI), else default readline
+  if (!tpl.createAsk) loadCommandHistory();
+  const ask = tpl.createAsk ? tpl.createAsk(COMMANDS) : createAsk(COMMANDS);
 
   const sessionStart = Date.now();
   const sessionStats = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
@@ -319,7 +330,9 @@ async function run() {
   while (true) {
     let user;
     try {
-      user = String(await ask(tpl.prompt)).trim();
+      const raw = await ask(tpl.prompt);
+      if (raw === null) break; // EOF / Ctrl+D from blessed
+      user = String(raw).trim();
     } catch {
       break;
     }
@@ -339,7 +352,10 @@ async function run() {
     }
 
     if (user === "/history") {
-      process.stdout.write(JSON.stringify(messages, null, 2) + "\n");
+      const json = JSON.stringify(messages, null, 2);
+      // Route through template info when it manages its own display (e.g. blessed)
+      if (tpl.createAsk) { tpl.info(`history: ${messages.length} messages (JSON logged to debug)`); logger.json("history", { messages }); }
+      else process.stdout.write(json + "\n");
       continue;
     }
 
@@ -371,7 +387,8 @@ async function run() {
       if (!models.length) { tpl.error("No models returned — check LM Studio version supports /api/v0/models"); continue; }
       tpl.info(`${models.length} model(s) found`);
 
-      const picked = await select(models, { label: `select a model  (loaded: ${args.model}):` });
+      const doSelect = tpl.select ?? select;
+      const picked = await doSelect(models, { label: `select a model  (loaded: ${args.model}):` });
       if (!picked || picked === args.model) continue;
 
       let stopSpinner = startSpinner(`unloading  ${args.model}`);
@@ -402,7 +419,8 @@ async function run() {
         t === args.template ? `${t} (current)` : t
       );
 
-      const picked = await select(labels, { label: "select a design:" });
+      const doSelectD = tpl.select ?? select;
+      const picked = await doSelectD(labels, { label: "select a design:" });
       if (!picked) continue;
 
       // Extract template name (strip " (current)" suffix if present)
@@ -414,8 +432,10 @@ async function run() {
       }
 
       try {
+        tpl.cleanup?.();                    // let old template clean up (e.g. destroy blessed screen)
         const newTpl = await loadTemplate(newTemplate);
         tpl = newTpl;
+        _tpl = tpl;
         args.template = newTemplate;
         logger.ok("template", `switched to: "${newTemplate}"`);
         tpl.info(`design → ${newTemplate}`);
@@ -462,11 +482,13 @@ async function run() {
     }
   }
 
-  process.stdin.pause();
+  if (!tpl.createAsk) process.stdin.pause();
   // Final history save (non-fatal — logs error if it fails)
   if (args.history) await saveHistorySafe(args.history, messages);
   // Flush any remaining stats before exit
   await flushStats();
+  // Let template clean up (destroy blessed screen, etc.)
+  tpl.cleanup?.();
 }
 
 run().catch((e) => {
