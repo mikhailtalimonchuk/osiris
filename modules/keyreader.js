@@ -1,79 +1,88 @@
+/** Enable SGR extended mouse tracking (reports button, col, row on click). */
+export function enableMouse()  { process.stdout.write("\x1b[?1000h\x1b[?1006h"); }
+
+/** Disable mouse tracking and restore normal input. */
+export function disableMouse() { process.stdout.write("\x1b[?1000l\x1b[?1006l"); }
+
 /**
- * Read a single keypress from stdin in raw mode.
- * Handles multi-byte escape sequences (arrow keys, etc.) by buffering.
- * Returns the full key sequence string.
- * 
- * @param {number} timeoutMs - Timeout in ms (default 30000)
- * @returns {Promise<string>} The key sequence
+ * Read a single keypress (or mouse click) from stdin in raw mode.
+ * Handles multi-byte escape sequences (arrow keys, SGR mouse events, etc.).
+ * Returns the full sequence string, or null on timeout.
+ *
+ * @param {number} timeoutMs - Timeout in ms (default 30000). 0 = wait forever.
+ * @returns {Promise<string|null>} The key sequence, or null on timeout.
  */
 export function readKey(timeoutMs = 30000) {
   return new Promise((resolve) => {
     let buf = "";
-    let timer = null;
-    
-    const resetTimer = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        cleanup();
-        resolve(buf || "\n");
-      }, 50); // 50ms to collect full escape sequence
-    };
-    
-    const cleanup = () => {
+    let seqTimer  = null; // 50ms debounce for partial escape sequences
+    let hardTimer = null; // outer hard timeout
+
+    const resolveWith = (val) => {
+      clearTimeout(seqTimer);
+      clearTimeout(hardTimer);
       process.stdin.off("data", onData);
       process.stdin.setRawMode(false);
-      if (timer) clearTimeout(timer);
+      resolve(val);
     };
-    
+
+    const flush = () => resolveWith(buf || null);
+
     const onData = (data) => {
       buf += data.toString();
-      
-      // If we have a complete escape sequence or a simple key
-      if (buf === "\u001b") {
-        // Incomplete escape - wait for more
-        resetTimer();
+      clearTimeout(seqTimer);
+
+      if (buf === "") {
+        // Lone escape — wait 50ms to see if more bytes follow (e.g. arrow key)
+        seqTimer = setTimeout(flush, 50);
         return;
       }
-      
-      // Complete sequences: \u001b[A, \u001b[B, \u001b[C, \u001b[D, etc.
-      if (buf.startsWith("\u001b[")) {
-        if (buf.length >= 3 && /[A-Za-z]/.test(buf[buf.length - 1])) {
-          cleanup();
-          resolve(buf);
-          return;
+
+      if (buf.startsWith("[")) {
+        // Escape sequence — keep buffering until a letter or ~ terminates it
+        if (buf.length >= 3 && /[A-Za-z~]/.test(buf[buf.length - 1])) {
+          resolveWith(buf);
+        } else {
+          seqTimer = setTimeout(flush, 50);
         }
-        resetTimer();
         return;
       }
-      
-      // Simple key (Enter, etc.)
-      cleanup();
-      resolve(buf);
+
+      // Simple key (printable char, Enter, Ctrl+*, etc.)
+      resolveWith(buf);
     };
-    
+
     process.stdin.setRawMode(true);
     process.stdin.on("data", onData);
-    
-    // Hard timeout
-    timer = setTimeout(() => {
-      cleanup();
-      resolve(buf || "\n");
-    }, timeoutMs);
+
+    if (timeoutMs > 0) {
+      hardTimer = setTimeout(() => resolveWith(null), timeoutMs);
+    }
   });
 }
 
 /**
- * Parse a key sequence into a meaningful action.
- * 
- * @param {string} key - The raw key sequence
- * @returns {string} "left", "right", "up", "down", "enter", "escape", or "other"
+ * Parse a raw key sequence into a meaningful action name.
+ *
+ * @param {string|null} key
+ * @returns {string} one of: left right up down enter escape click mouse timeout other
  */
 export function parseKey(key) {
-  if (key === "\u001b[D") return "left";
-  if (key === "\u001b[C") return "right";
-  if (key === "\u001b[A") return "up";
-  if (key === "\u001b[B") return "down";
-  if (key === "\u001b") return "escape";
-  if (key === "\r" || key === "\n") return "enter";
+  if (key === null)                     return "timeout";
+  if (key === "[D")               return "left";
+  if (key === "[C")               return "right";
+  if (key === "[A")               return "up";
+  if (key === "[B")               return "down";
+  if (key === "")                 return "escape";
+  if (key === "\r" || key === "\n")     return "enter";
+
+  // SGR extended mouse: \x1b[<button;col;rowM (press) or m (release)
+  const m = key.match(/\[<(\d+);(\d+);(\d+)([Mm])/);
+  if (m) {
+    const btn  = parseInt(m[1]) & 0x43; // strip modifier bits, keep button id
+    const type = m[4] === "M" ? "press" : "release";
+    return (btn === 0 && type === "press") ? "click" : "mouse";
+  }
+
   return "other";
 }

@@ -32,6 +32,18 @@ PROJECT_CONFIG_NAME = ".osiris.json"
 _CONFIG_TO_ARGPARSE: Dict[str, str] = {
     "baseUrl":     "base_url",
     "model":       "model",
+    "system":      "argparse_system", # This is a bit tricky because of how I'll use it. Let's just map to the arg name.
+    "temperature": "temperature",
+    "maxTokens":   "max_tokens",
+    "stream":      "stream",
+    "timeout":     "timeout",
+    "history":     "history",
+}
+
+# Actually, let's redefine it more simply to avoid confusion during the rewrite.
+_CONFIG_MAP: Dict[str, str] = {
+    "baseUrl":     "base_url",
+    "model":       "model",
     "system":      "system",
     "temperature": "temperature",
     "maxTokens":   "max_tokens",
@@ -109,24 +121,20 @@ def _url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + "/" + path.lstrip("/")
 
 
-def fetch_first_model(base_url: str, timeout_s: float) -> Optional[str]:
+def fetch_loaded_models(base_url: str, timeout_s: float) -> List[str]:
+    """Returns a list of IDs of currently loaded models."""
     url = _url(base_url, "/models")
     _dbg("models", f"GET {url} (timeout: {timeout_s}s)")
     try:
         r = requests.get(url, timeout=timeout_s)
         r.raise_for_status()
         models = r.json().get("data", [])
-        _dbg("models", f"HTTP {r.status_code} — {len(models)} model(s) returned")
-        if not models:
-            _dbg("models", "list is empty — no model loaded in LM Studio")
-            return None
-        _dbg("models:list", "available models", [m.get("id") for m in models])
-        selected = models[0]["id"]
-        _dbg("models", f"auto-selected: {selected}")
-        return selected
+        model_ids = [m.get("id") for m in models if m.get("id")]
+        _dbg("models", f"HTTP {r.status_code} — {len(model_ids)} model(s) loaded")
+        return model_ids
     except Exception as e:
         _dbg("models", f"request error: {e}")
-        return None
+        return []
 
 
 def _print_streaming_delta(resp: requests.Response) -> str:
@@ -218,7 +226,7 @@ def main() -> int:
     # CLI args always beat set_defaults(), which in turn beats add_argument(default=...).
     argparse_defaults = {
         dest: config[cfg_key]
-        for cfg_key, dest in _CONFIG_TO_ARGPARSE.items()
+        for cfg_key, dest in _CONFIG_MAP.items()
         if cfg_key in config
     }
 
@@ -231,7 +239,7 @@ def main() -> int:
     p.add_argument("--stream", action="store_true", help="Stream tokens")
     p.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds")
     p.add_argument("--history", default=None, help="Path to JSON history file (optional)")
-    p.add_argument("--once", default=None, metavar="MESSAGE", help="Send a single message and exit (non-interactive)")
+    p.add_argument("--once", default=None, metavar="MESSAGE", help="Send a single message and excludes (non-interactive)")
     p.add_argument("--debug", action="store_true", help="Print debug info for each step to stderr")
     p.set_defaults(**argparse_defaults)
     args = p.parse_args()
@@ -242,16 +250,26 @@ def main() -> int:
         _dbg("debug", "debug mode enabled")
         _dbg("args", "parsed arguments", {k: v for k, v in vars(args).items() if k != "debug"})
 
+    # 1. Check what models are actually loaded
+    loaded_models = fetch_loaded_models(args.base_url, args.timeout)
+
     model = args.model
-    if not model:
-        _dbg("models", f"no model set — querying {args.base_url}")
-        model = fetch_first_model(args.base_url, args.timeout)
-        if not model:
+    if model:
+        if model not in loaded_models:
+            if not loaded_models:
+                print(f"Error: Specified model '{model}' is not loaded and no other models are loaded.", file=sys.stderr)
+                return 1
+            else:
+                print(f"Warning: Specified model '{model}' is not currently loaded.", file=sys.stderr)
+                print(f"Loaded models: {', '.join(loaded_models)}", file=sys.stderr)
+        else:
+            _dbg("models", f"model set explicitly and is loaded: {model}")
+    else:
+        if not loaded_models:
             print("No model loaded in LM Studio. Load a model or pass --model.", file=sys.stderr)
             return 1
+        model = loaded_models[0]
         print(f"Auto-selected model: {model}")
-    else:
-        _dbg("models", f"model set explicitly: {model}")
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": args.system}]
     if args.history:
@@ -320,8 +338,8 @@ def main() -> int:
                 save_history(args.history, messages)
                 print(f"(saved to {args.history})")
             except Exception as e:
-                print(f"Failed to save: {e}", file=sys.stderr)
-            continue
+                print(f"Failed to save: {else}", file=sys.stderr)
+                continue
 
         messages.append({"role": "user", "content": user})
         try:

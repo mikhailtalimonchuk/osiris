@@ -1,13 +1,13 @@
-import { parseKey } from "./keyreader.js";
+import { readKey, parseKey, enableMouse, disableMouse } from "./keyreader.js";
 
 // ── ANSI helpers ─────────────────────────────────────────────────────────────
 
-const R       = "\x1b[0m";
-const BOLD    = "\x1b[1m";
-const DIM     = "\x1b[2m";
-const CYAN    = "\x1b[36m";
-const YELLOW  = "\x1b[33m";
-const GREEN   = "\x1b[32m";
+const R      = "\x1b[0m";
+const BOLD   = "\x1b[1m";
+const DIM    = "\x1b[2m";
+const CYAN   = "\x1b[36m";
+const YELLOW = "\x1b[33m";
+const GREEN  = "\x1b[32m";
 
 function visibleLen(s) {
   return s.replace(/\x1b\[[0-9;]*m/g, "").length;
@@ -21,70 +21,17 @@ function rows() {
   return Math.max(12, process.stdout.rows || 24);
 }
 
-// ── Mouse tracking ───────────────────────────────────────────────────────────
-
-function enableMouse()  { process.stdout.write("\x1b[?1000h\x1b[?1006h"); }
-function disableMouse() { process.stdout.write("\x1b[?1000l\x1b[?1006l"); }
-
-function parseMouseEvent(str) {
-  const m = str.match(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
-  if (!m) return null;
-  return {
-    button: parseInt(m[1]) & 0x43,
-    col:    parseInt(m[2]),
-    row:    parseInt(m[3]),
-    type:   m[4] === "M" ? "press" : "release",
-  };
-}
+// ── Read one action (key or mouse click) ─────────────────────────────────────
 
 /**
- * Read one input event from stdin — either a mouse click or a keypress.
- * Returns { type: 'click' } for left-button press, { type: 'key', key: string } for keypresses,
- * or { type: 'timeout' } if timeoutMs elapses.
+ * Wait for a single key or mouse click.
+ * Returns the parsed action string ("enter", "escape", "click", "up", "down", "timeout", …)
  */
-async function waitForInput(timeoutMs = 10_000) {
-  return new Promise((resolve) => {
-    const wasRaw    = process.stdin.isRaw;
-    const wasPaused = !process.stdin.readableFlowing && process.stdin.isPaused?.();
-    if (!wasRaw) process.stdin.setRawMode(true);
-    process.stdin.resume();
-
-    let timer = null;
-
-    function cleanup(result) {
-      clearTimeout(timer);
-      disableMouse();
-      process.stdin.removeListener("data", onData);
-      if (!wasRaw) process.stdin.setRawMode(false);
-      if (wasPaused) process.stdin.pause();
-      resolve(result);
-    }
-
-    function onData(buf) {
-      const str = buf.toString("utf8");
-
-      // Ctrl+C — pass through as key so caller can handle exit
-      if (str === "\x03") { cleanup({ type: "key", key: str }); return; }
-
-      const mouse = parseMouseEvent(str);
-      if (mouse) {
-        if (mouse.button === 0 && mouse.type === "press") {
-          cleanup({ type: "click" });
-        }
-        // ignore releases and other buttons
-        return;
-      }
-
-      cleanup({ type: "key", key: str });
-    }
-
-    enableMouse();
-    process.stdin.on("data", onData);
-
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => cleanup({ type: "timeout" }), timeoutMs);
-    }
-  });
+async function readAction(timeoutMs = 0) {
+  enableMouse();
+  const key = await readKey(timeoutMs);
+  disableMouse();
+  return parseKey(key);
 }
 
 // ── Summary helpers ──────────────────────────────────────────────────────────
@@ -110,102 +57,76 @@ export function buildSummary(name, args, result) {
 function formatCollapsed({ name, argPairs, moreArgs, lineCount, charCount }) {
   const header = `${YELLOW}⚙${R} ${BOLD}${name}${R}(${argPairs}${moreArgs})`;
   const meta   = `${DIM}${lineCount}L ${charCount}C${R}`;
-  const hint   = `${DIM}[${GREEN}▶${R} click/Enter]${R}`;
+  const hint   = `${DIM}[${GREEN}▶${R}${DIM} click/Enter]${R}`;
   return { header, meta, hint };
 }
 
 // ── Interactive viewer ───────────────────────────────────────────────────────
 
+/**
+ * Display a tool result with interactive expand support.
+ *
+ * Shows a compact 1-line collapsed summary. Left-click or Enter/Space expands
+ * the full result inline (appended below — no cursor tricks). Long results are
+ * paginated; click/Enter advances pages, Escape closes early.
+ */
 export async function displayToolResult({ name, args, result, renderCollapsed, renderExpanded }) {
-  const pageSize = Math.max(8, rows() - 6);
-  const summary  = buildSummary(name, args, result);
+  const pageSize  = Math.max(8, rows() - 6);
+  const summary   = buildSummary(name, args, result);
   const collapsed = formatCollapsed(summary);
+  const w = cols();
 
   process.stdout.write("\n");
 
+  // ── Collapsed summary ───────────────────────────────────────────────────
   if (renderCollapsed) {
     renderCollapsed({ name, args, result, ...collapsed });
   } else {
-    const w       = cols();
     const content = `${collapsed.header}  ${collapsed.meta}  ${collapsed.hint}`;
-    const pad     = Math.max(0, w - 4 - visibleLen(content));
+    const pad = Math.max(0, w - 4 - visibleLen(content));
     process.stdout.write(`${DIM}┌${R} ${content}${" ".repeat(pad)} ${DIM}┐${R}\n`);
   }
 
-  process.stdout.write(`  ${DIM}click or Enter to expand  ·  other key to skip${R}\n`);
+  // ── Wait for expand decision (8s auto-skip) ─────────────────────────────
+  const decision = await readAction(8_000);
+  const shouldExpand = decision === "enter" || decision === "click";
 
-  const input = await waitForInput(8_000);
-
-  if (input.type === "timeout") {
+  if (!shouldExpand) {
     process.stdout.write("\n");
     return;
   }
 
-  if (input.type === "key") {
-    const action = parseKey(input.key);
-    if (action !== "enter" && input.key !== " ") {
-      process.stdout.write("\n");
-      return;
-    }
-  }
-  // type === 'click' OR enter/space key → expand
-
-  await showExpanded({ name, args, result, pageSize, renderExpanded, collapsed });
-  process.stdout.write("\n");
-}
-
-async function showExpanded({ name, args, result, pageSize, renderExpanded, collapsed }) {
+  // ── Expanded view: append-only, paginated ──────────────────────────────
   const lines      = result.split("\n");
   const totalPages = Math.max(1, Math.ceil(lines.length / pageSize));
-  let page = 0;
 
-  while (true) {
-    const clearCount = pageSize + 2;
-    process.stdout.write(`\x1b[${clearCount}A`);
-
-    const w       = cols();
-    const content = `${collapsed.header}  ${collapsed.meta}  ${DIM}expanded${R}`;
-    const pad     = Math.max(0, w - 4 - visibleLen(content));
-    process.stdout.write(`${DIM}┌${R} ${content}${" ".repeat(pad)} ${DIM}┐${R}\n`);
-
-    const startIdx = page * pageSize;
+  for (let page = 0; page < totalPages; page++) {
+    const startIdx  = page * pageSize;
     const pageLines = lines.slice(startIdx, startIdx + pageSize);
 
     if (renderExpanded) {
       renderExpanded({ name, args, result, pageLines, page, totalPages, pageSize });
     } else {
       for (const line of pageLines) {
-        const linePad = Math.max(0, w - 6 - visibleLen(line));
-        process.stdout.write(`  ${DIM}│${R} ${CYAN}${line}${R}${" ".repeat(linePad)}\n`);
-      }
-      const remaining = pageSize - pageLines.length;
-      for (let i = 0; i < remaining; i++) {
-        process.stdout.write(`  ${DIM}│${R}\n`);
+        const pad = Math.max(0, w - 6 - visibleLen(line));
+        process.stdout.write(`  ${DIM}│${R} ${CYAN}${line}${R}${" ".repeat(pad)}\n`);
       }
     }
 
-    const pageInfo = `${DIM}${page + 1}/${totalPages}  ↑↓ scroll  click/Esc/Enter close${R}`;
-    process.stdout.write(`  ${pageInfo}\n`);
-
-    const input = await waitForInput(30_000);
-
-    if (input.type === "click" || input.type === "timeout") {
-      break;
+    if (page === totalPages - 1) {
+      if (totalPages > 1) {
+        process.stdout.write(`  ${DIM}── end (${totalPages} pages) ──${R}\n`);
+      }
+    } else {
+      process.stdout.write(
+        `  ${DIM}── page ${page + 1}/${totalPages}  ·  click/Enter next  ·  Esc close ──${R}\n`
+      );
+      const next = await readAction(0); // wait indefinitely on pagination
+      if (next === "escape") break;
     }
-
-    const action = parseKey(input.key);
-    if (action === "up")          page = Math.max(0, page - 1);
-    else if (action === "down")   page = Math.min(totalPages - 1, page + 1);
-    else if (action === "escape" || action === "enter") break;
   }
 
-  // Erase expanded area
-  const clearCount = pageSize + 3;
-  process.stdout.write(`\x1b[${clearCount}A`);
-  for (let i = 0; i < clearCount; i++) {
-    process.stdout.write("\x1b[2K\r\n");
-  }
-  process.stdout.write(`\x1b[${clearCount}A`);
+  process.stdout.write("\n");
 }
 
 // ── Static (non-interactive) display ────────────────────────────────────────
@@ -213,12 +134,12 @@ async function showExpanded({ name, args, result, pageSize, renderExpanded, coll
 export function displayToolResultStatic({ name, args, result, maxPreviewLines = 8 }) {
   const summary   = buildSummary(name, args, result);
   const collapsed = formatCollapsed(summary);
-  const w         = cols();
+  const w = cols();
 
   process.stdout.write("\n");
 
   const content = `${collapsed.header}  ${collapsed.meta}`;
-  const pad     = Math.max(0, w - 4 - visibleLen(content));
+  const pad = Math.max(0, w - 4 - visibleLen(content));
   process.stdout.write(`${DIM}┌${R} ${content}${" ".repeat(pad)} ${DIM}┐${R}\n`);
 
   const lines   = result.split("\n");
